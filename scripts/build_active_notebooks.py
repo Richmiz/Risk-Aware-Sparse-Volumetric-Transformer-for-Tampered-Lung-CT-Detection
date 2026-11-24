@@ -24,24 +24,13 @@ REVIEW_ARCHIVE = ROOT/'notebooks/archive/20261117_human_readable/02_ANNOTATION_R
 REVIEW_RUNTIME = ROOT/'scripts/notebook_support/annotation_review_runtime.py'
 FROZEN_REVIEW_SHA = '4c04973de96823a01585ce5741b8cf2ce70689ec5328567593a5204678bea224'
 
-# Clones the repository into the runtime. A token, when present, travels in git's
-# environment, so it never appears in a command line, an error or an output.
+# Clones the public repository into the runtime. No sign-in is needed; git never
+# prompts, so a failed clone stops with its error instead of waiting for input.
 CODE_CELL = (
-    'import base64, importlib.util, os, subprocess, sys\n'
+    'import importlib.util, os, subprocess, sys\n'
     'from pathlib import Path\n'
     'CODE_ROOT = Path("/content/rsvt-code")\n'
     'env = dict(os.environ, GIT_TERMINAL_PROMPT="0")\n'
-    'try:\n'
-    '    from google.colab import userdata\n'
-    '    token = userdata.get("GITHUB_TOKEN")  # needed while the repository is private\n'
-    'except Exception:\n'
-    '    token = None\n'
-    'if token:\n'
-    '    basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()\n'
-    '    env.update(GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="http.https://github.com/.extraHeader",\n'
-    '               GIT_CONFIG_VALUE_0="Authorization: Basic " + basic)\n'
-    '    del basic\n'
-    'del token\n'
     '\n'
     'def git(*args):\n'
     '    done = subprocess.run(["git", *args], env=env, capture_output=True, text=True)\n'
@@ -86,8 +75,6 @@ def training_notebook():
         'CycleGAN, pix2pix and diffusion generators), checks it, trains the coarse-to-fine RSVT and shows its results.\n\n'
         '**Open this notebook in Google Colab from GitHub and choose a GPU runtime** (Runtime → Change runtime type). '
         'The project code is cloned from GitHub at `CODE_REF`, and the exact commit is saved with each session. '
-        'While the repository is private, add a read-only GitHub token for it as the Colab secret `GITHUB_TOKEN` '
-        '(key icon in the left sidebar) and allow notebook access. '
         'Every output saves automatically to project Drive and is read back against a checksum.\n\n'
         '**Data preparation downloads data only when you set `PREPARE_DATA = True`.** With the default patient caps it fetches '
         'about 260 LIDC-IDRI series from the public TCIA API (~30 GB) and streams the three author archives '
@@ -118,8 +105,8 @@ def training_notebook():
          'from google.colab import drive\ndrive.mount("/content/drive", force_remount=False)\n'),
         ('code','3. Get the project code from GitHub',
          'Why: the implementation lives in the repository, not in long cells. This clones it into the runtime, checks out '
-         '`CODE_REF` and installs the two missing packages. Expected output: the exact commit being run. If cloning fails '
-         'while the repository is private, check the `GITHUB_TOKEN` secret and its notebook access.',
+         '`CODE_REF` and installs the two missing packages. The repository is public, so no sign-in is needed. '
+         'Expected output: the exact commit being run.',
          CODE_CELL),
         ('session','4. Create a saved session',
          'Why: each run gets its own Drive folder with its settings and code commit. The M3Dsynth metadata tables are '

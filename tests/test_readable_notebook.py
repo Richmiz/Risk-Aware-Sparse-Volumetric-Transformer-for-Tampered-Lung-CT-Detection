@@ -90,20 +90,16 @@ class ReadableSessionTests(unittest.TestCase):
 
 
 class NotebookSourceTests(unittest.TestCase):
-    def test_training_notebook_loads_code_from_github_without_exposing_the_token(self):
+    def test_training_notebook_clones_the_public_repository_without_credentials(self):
         doc=json.loads((ROOT/'notebooks/01_RSVT_TRAINING.ipynb').read_text(encoding='utf-8'))
         code={c['id']:''.join(c['source']) for c in doc['cells'] if c['cell_type']=='code'}
         self.assertIn('CODE_REF = "main"',code['settings'])
         self.assertIn('github.com/Richmiz/',code['settings'])
-        loader=code['code']
-        self.assertIn('userdata.get("GITHUB_TOKEN")',loader)
-        self.assertIn('GIT_CONFIG_VALUE_0',loader)  # the token travels in git's environment only
-        self.assertIn('GIT_TERMINAL_PROMPT="0"',loader)
-        self.assertNotIn('print(token',loader); self.assertNotIn('{token}@',loader)
+        self.assertIn('GIT_TERMINAL_PROMPT="0"',code['code'])  # a failed clone errors instead of waiting for a login
         self.assertIn('code_commit=RSVT_COMMIT',code['session'])
-        everything=''.join(code.values())
-        for retired in ('RSVT_NOTEBOOK_RUNTIME','release_2026','runpy'):
-            self.assertNotIn(retired,everything)
+        text=''.join(''.join(c['source']) for c in doc['cells'])
+        for retired in ('GITHUB_TOKEN','userdata','extraHeader','token','RSVT_NOTEBOOK_RUNTIME','release_2026','runpy'):
+            self.assertNotIn(retired,text)
 
     def test_two_notebooks_have_no_embedded_archives_and_explain_every_code_cell(self):
         paths=list((ROOT/'notebooks').glob('*.ipynb'))
