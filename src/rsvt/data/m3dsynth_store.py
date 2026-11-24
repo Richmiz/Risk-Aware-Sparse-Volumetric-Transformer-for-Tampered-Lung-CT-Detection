@@ -54,6 +54,17 @@ CANDIDATE_OFFSETS = (0, 512, 1024, 2000, 2048)
 TCIA_BASE = "https://services.cancerimagingarchive.net/nbia-api/services/v1"
 ARCHIVE_BASE = "https://www.grip.unina.it/download/prog/M3Dsynth"
 ARCHIVE_SIZES_GB = {"cycle": 171, "pix2pix": 142, "diffusion": 161}
+# Author metadata tables (no images) at a pinned commit of github.com/grip-unina/M3Dsynth.
+# The SHA-256 values are those of the copies audited on 11 Nov 2026, unchanged at this commit.
+METADATA_COMMIT = "f1461b74abac878fed45a3f0caf7bb4b72ff00d3"
+METADATA_FILES = {
+    "data.csv": ("data/data.csv", "fbacb7e2d3edbb9ca4581b2f5fb86b776fa9299cb8b3d629999faa49dbf24c44"),
+    "LIDC.csv": ("data/LIDC.csv", "1da68f5fca3d8dab984af987fcbdda7493239522a80871929580b844b236851d"),
+    "sets.csv": ("data/sets.csv", "f16458a8ca90b68bfb9bd67e453ffce955641ce0d1f2729c1c0badd4db6c841e"),
+    "centers.csv": ("data/centers.csv", "1a27ee50264b944d8bee55c0400156092a3d28e3a2ed8b0ade7e48d48b82b2ee"),
+    "LICENSE.md": ("LICENSE.md", "aed4e157a210c033bb296584a509d95224c4b441b94a5c2fe200eb7206cd43a7"),
+    "README.md": ("README.md", "3bcb8dfd278631e385291b95480714e8c775cf340a4ecaec057c14a63aa6ec83"),
+}
 SLIDE = re.compile(r"slide(\d{4,})\.tiff?$")
 
 
@@ -342,6 +353,28 @@ def find_tcia_series(expected, *, base=TCIA_BASE, fetch=_fetch):
     if len(hits) != 1:
         raise ValueError(f"TCIA series for {expected['series_key']} is not unique ({len(hits)} matches)")
     return hits[0]["SeriesInstanceUID"]
+
+
+def fetch_metadata(destination, *, fetch=_fetch):
+    """Download the author metadata tables at the pinned commit; each file must match its SHA-256.
+
+    Copies that already match are kept. No image is downloaded.
+    """
+    destination = Path(destination)
+    destination.mkdir(parents=True, exist_ok=True)
+    fetched = []
+    for name, (remote, expected) in METADATA_FILES.items():
+        target = destination / name
+        if target.is_file() and sha256_path(target) == expected:
+            continue
+        data = fetch(f"https://raw.githubusercontent.com/grip-unina/M3Dsynth/{METADATA_COMMIT}/{remote}")
+        if sha256_bytes(data) != expected:
+            raise ValueError(f"M3Dsynth metadata {name} differs from the audited copy; nothing was replaced")
+        part = target.with_name(target.name + ".part")
+        part.write_bytes(data)
+        part.replace(target)
+        fetched.append(name)
+    return {"commit": METADATA_COMMIT, "fetched": fetched, "files": sorted(METADATA_FILES)}
 
 
 def safe_extract_zip(data, destination):

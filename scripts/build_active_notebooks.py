@@ -1,11 +1,14 @@
 """Build two readable entry points. User-requested rename: 17 November 2026.
 
 17 Nov 2026 (later): 01_RSVT_TRAINING now prepares M3Dsynth and trains the
-coarse-to-fine RSVT from its own release folder. The review notebook keeps its
-original release path and frozen backend, so it rebuilds byte-identically.
+coarse-to-fine RSVT. The review notebook keeps its original release path and
+frozen backend, so it rebuilds byte-identically.
+
+24 Nov 2026: the user runs 01_RSVT_TRAINING online in Colab, opened from GitHub.
+It clones the project code from GitHub at `CODE_REF` and saves the exact commit
+with the session, instead of loading a code release copied to Drive.
 """
 
-import argparse
 from copy import deepcopy
 from datetime import datetime, timezone
 import hashlib
@@ -13,18 +16,61 @@ import json
 from pathlib import Path
 
 from notebook_layout import ACTIVE_NOTEBOOKS
-from build_colab_bundle import build_bundle
 
 ROOT = Path(__file__).resolve().parents[1]
 RELEASE = 'outputs/rsvt_training/release_20261117_human_readable'  # review notebook only
-TRAINING_RELEASE_NAME = 'release_20261117_m3dsynth_c2f'
-TRAINING_RELEASE = 'outputs/rsvt_training/' + TRAINING_RELEASE_NAME
-TRAINING_ARCHIVE = 'rsvt-c2f-runtime-20261117.zip'
-RELEASE_DIR = ROOT/'artifacts'/TRAINING_RELEASE_NAME
+REPOSITORY = 'https://github.com/Richmiz/Risk-Aware-Sparse-Volumetric-Transformer-for-Tampered-Lung-CT-Detection.git'
 REVIEW_ARCHIVE = ROOT/'notebooks/archive/20261117_human_readable/02_ANNOTATION_REVIEW.ipynb'
 REVIEW_RUNTIME = ROOT/'scripts/notebook_support/annotation_review_runtime.py'
-BOOTSTRAP = RELEASE_DIR/'RSVT_NOTEBOOK_RUNTIME.py'
 FROZEN_REVIEW_SHA = '4c04973de96823a01585ce5741b8cf2ce70689ec5328567593a5204678bea224'
+
+# Clones the repository into the runtime. A token, when present, travels in git's
+# environment, so it never appears in a command line, an error or an output.
+CODE_CELL = (
+    'import base64, importlib.util, os, subprocess, sys\n'
+    'from pathlib import Path\n'
+    'CODE_ROOT = Path("/content/rsvt-code")\n'
+    'env = dict(os.environ, GIT_TERMINAL_PROMPT="0")\n'
+    'try:\n'
+    '    from google.colab import userdata\n'
+    '    token = userdata.get("GITHUB_TOKEN")  # needed while the repository is private\n'
+    'except Exception:\n'
+    '    token = None\n'
+    'if token:\n'
+    '    basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()\n'
+    '    env.update(GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="http.https://github.com/.extraHeader",\n'
+    '               GIT_CONFIG_VALUE_0="Authorization: Basic " + basic)\n'
+    '    del basic\n'
+    'del token\n'
+    '\n'
+    'def git(*args):\n'
+    '    done = subprocess.run(["git", *args], env=env, capture_output=True, text=True)\n'
+    '    if done.returncode:\n'
+    '        raise RuntimeError(f"git {args[0]} failed: {done.stderr.strip()[-300:]}")\n'
+    '    return done.stdout.strip()\n'
+    '\n'
+    'if not (CODE_ROOT / ".git").exists():\n'
+    '    git("clone", "--quiet", REPOSITORY, str(CODE_ROOT))\n'
+    'git("-C", str(CODE_ROOT), "fetch", "--quiet", "--tags", "origin")\n'
+    'commit = None\n'
+    'for candidate in (f"origin/{CODE_REF}", CODE_REF):\n'
+    '    try:\n'
+    '        commit = git("-C", str(CODE_ROOT), "rev-parse", "--verify", "--quiet", candidate + "^{commit}")\n'
+    '        break\n'
+    '    except RuntimeError:\n'
+    '        pass\n'
+    'if commit is None:\n'
+    '    raise RuntimeError(f"CODE_REF {CODE_REF!r} is not a branch, tag or commit of the repository")\n'
+    'if "rsvt" in sys.modules and globals().get("RSVT_COMMIT") not in (None, commit):\n'
+    '    raise RuntimeError("This session already loaded other code. Runtime > Restart session, then Run all.")\n'
+    'git("-C", str(CODE_ROOT), "checkout", "--quiet", "--detach", commit)\n'
+    'RSVT_COMMIT = commit\n'
+    'for module, requirement in (("pydicom", "pydicom==3.0.2"), ("SimpleITK", "SimpleITK==2.5.7")):\n'
+    '    if importlib.util.find_spec(module) is None:\n'
+    '        subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", requirement], check=True)\n'
+    'if str(CODE_ROOT / "src") not in sys.path:\n'
+    '    sys.path.insert(0, str(CODE_ROOT / "src"))\n'
+    'print("Project code at commit", commit)\n')
 
 
 def cell(kind, source, name):
@@ -34,12 +80,15 @@ def cell(kind, source, name):
 
 
 def training_notebook():
-    checksum=hashlib.sha256(BOOTSTRAP.read_bytes()).hexdigest()
     cells=[cell('markdown',
         '# RSVT — M3Dsynth Training and Results (coarse-to-fine)\n\n'
         'This notebook prepares the **M3Dsynth** dataset (manipulated LIDC-IDRI lung CT: nodule removal and insertion by '
         'CycleGAN, pix2pix and diffusion generators), checks it, trains the coarse-to-fine RSVT and shows its results.\n\n'
-        '**Use a Colab GPU kernel in VS Code.** Every output saves automatically to project Drive and is read back against a checksum.\n\n'
+        '**Open this notebook in Google Colab from GitHub and choose a GPU runtime** (Runtime → Change runtime type). '
+        'The project code is cloned from GitHub at `CODE_REF`, and the exact commit is saved with each session. '
+        'While the repository is private, add a read-only GitHub token for it as the Colab secret `GITHUB_TOKEN` '
+        '(key icon in the left sidebar) and allow notebook access. '
+        'Every output saves automatically to project Drive and is read back against a checksum.\n\n'
         '**Data preparation downloads data only when you set `PREPARE_DATA = True`.** With the default patient caps it fetches '
         'about 260 LIDC-IDRI series from the public TCIA API (~30 GB) and streams the three author archives '
         '(cycle 171 GB, pix2pix 142 GB, diffusion 161 GB) from grip.unina.it. Only verified boxes around each edit are kept, '
@@ -48,10 +97,13 @@ def training_notebook():
         'Test patients are not downloaded or opened here.\n', 'introduction')]
     sections=[
         ('settings','1. Choose the run settings',
-         'Why: keep the settings you may change in one place. To resume a session, paste its Drive folder into `RESUME_SESSION` '
-         'and keep the same settings. `LIDC_ROOT` may point to an existing LIDC-IDRI download in Drive (NBIA folder layout); '
+         'Why: keep the settings you may change in one place. `CODE_REF` chooses the code: a branch, a tag or a commit. '
+         'To resume a session, paste its Drive folder into `RESUME_SESSION` and keep the same settings and code. '
+         '`LIDC_ROOT` may point to an existing LIDC-IDRI download in Drive (NBIA folder layout); '
          'leave it empty to fetch series from TCIA.',
          'PROJECT = "/content/drive/MyDrive/Research/LUNG-CT-SCAN"\n'
+         f'REPOSITORY = "{REPOSITORY}"\n'
+         'CODE_REF = "main"         # branch, tag or commit; the exact commit is saved with the session\n'
          'PREPARE_DATA = False      # True = download/stream and verify M3Dsynth (resumable)\n'
          'RUN_DIAGNOSTICS = True    # resolution and shortcut checks before training\n'
          'RUN_TRAINING = True\n'
@@ -62,64 +114,70 @@ def training_notebook():
          'LIDC_ROOT = ""            # optional existing LIDC-IDRI folder in Drive\n'
          'RESUME_SESSION = ""       # empty = a new session\n'),
         ('drive','2. Connect Google Drive',
-         'Why: the dataset store, code release and results live here. Use the Google account containing Research/LUNG-CT-SCAN.',
+         'Why: the dataset store and the results live here. Use the Google account containing Research/LUNG-CT-SCAN.',
          'from google.colab import drive\ndrive.mount("/content/drive", force_remount=False)\n'),
-        ('runtime','3. Load the project code and create a saved session',
-         'Why: implementation code lives in a checksum-verified release, not in long cells. Expected output: the session folder in Drive.',
-         'from pathlib import Path\nimport hashlib, runpy\n'
-         f'bootstrap = Path(PROJECT) / "{TRAINING_RELEASE}/RSVT_NOTEBOOK_RUNTIME.py"\n'
-         f'if hashlib.sha256(bootstrap.read_bytes()).hexdigest() != "{checksum}":\n'
-         '    raise RuntimeError("Project script checksum mismatch; no code was loaded.")\n'
-         'runtime = runpy.run_path(str(bootstrap), init_globals={"PROJECT": PROJECT})\n'
-         'session = runtime["create_session"](epochs=EPOCHS, learning_rate=LEARNING_RATE,\n'
+        ('code','3. Get the project code from GitHub',
+         'Why: the implementation lives in the repository, not in long cells. This clones it into the runtime, checks out '
+         '`CODE_REF` and installs the two missing packages. Expected output: the exact commit being run. If cloning fails '
+         'while the repository is private, check the `GITHUB_TOKEN` secret and its notebook access.',
+         CODE_CELL),
+        ('session','4. Create a saved session',
+         'Why: each run gets its own Drive folder with its settings and code commit. The M3Dsynth metadata tables are '
+         'downloaded from the authors\' GitHub at a pinned commit and checked against their recorded checksums. '
+         'Expected output: the session folder in Drive.',
+         'from rsvt.training.m3d_notebook import create_session\n'
+         'session = create_session(PROJECT, CODE_ROOT, epochs=EPOCHS, learning_rate=LEARNING_RATE,\n'
          '    patience=EARLY_STOPPING_PATIENCE, seed=SEED, patients_train=PATIENTS_TRAIN,\n'
          '    patients_validation=PATIENTS_VALIDATION, generators=tuple(GENERATORS),\n'
-         '    lidc_root=LIDC_ROOT or None, resume_session=RESUME_SESSION)\nprint("Session saved in Drive:", session.root)\n'),
-        ('hardware','4. Check the actual runtime and GPU',
+         '    lidc_root=LIDC_ROOT or None, resume_session=RESUME_SESSION, code_commit=RSVT_COMMIT)\n'
+         'print("Session saved in Drive:", session.root)\n'),
+        ('hardware','5. Check the actual runtime and GPU',
          'Why: a server label is not proof of a GPU. This checks what PyTorch sees. Data preparation runs on CPU; training needs CUDA.',
          'runtime_information = session.show_runtime()\n'),
-        ('plan','5. Review the data plan before downloading',
+        ('plan','6. Review the data plan before downloading',
          'Why: see patients, series, archive sizes and expected Drive storage before any transfer. Nothing is downloaded here.',
          'data_plan = session.plan_data()\n'),
-        ('prepare','6. Prepare and verify M3Dsynth',
+        ('prepare','7. Prepare and verify M3Dsynth',
          'Why: build the dataset store. Each manipulated slice is compared with the real LIDC slice while it streams; a sample is '
          'kept only if every change lies inside its stored box and the author mask is complete. With `PREPARE_DATA=False` this '
          'cell only verifies an existing store. Expected output: progress, then a checksum-verified manifest.',
          'manifest = session.prepare_data(download=PREPARE_DATA)\n'),
-        ('dataset','7. Inspect the dataset with real CT slices',
+        ('dataset','8. Inspect the dataset with real CT slices',
          'Why: confirm what the model will see. Expected output: counts per partition/generator/operation and training examples '
          'showing the authentic slice, the manipulated slice, their difference and the author mask. No test data is opened.',
          'if session.has_store():\n    dataset_overview = session.show_dataset()\n    preview_examples = session.show_previews()\n'),
-        ('diagnostics','8. Pre-training checks: resolution and shortcuts',
-         'Why: test the two review findings on real data before spending GPU time. (a) A small CNN classifies paired crops '
-         '(manipulated vs the same location in the authentic scan) at native resolution and degraded to the 96³ voxel size. '
-         '(b) Archive identity outside the edit, mask coverage, and whether whole-scan statistics alone separate classes. '
-         'Uses train/validation only.',
+        ('diagnostics','9. Pre-training checks: resolution and shortcuts',
+         'Why: test the review findings on real data before spending GPU time. (a) A small CNN separates manipulated crops '
+         'from authentic sites that look alike (removals vs healthy-tissue TB sites, insertions vs real-nodule TM sites) at '
+         'native resolution and degraded to the 96³ voxel size; results are shown per operation. This tests the evidence at '
+         'a known site, not whether the router can find it. (b) Archive identity outside the edit, mask coverage, and whether '
+         'whole-scan statistics alone separate classes. Uses train/validation only.',
          'if RUN_DIAGNOSTICS and session.has_store():\n    diagnostics = session.run_diagnostics()\n'),
-        ('configuration','9. Understand the training configuration',
+        ('configuration','10. Understand the training configuration',
          'Why: see batches, crops, loss and risk weights, early stopping and checkpoint selection before training.',
          'configuration_table = session.show_configuration()\n'),
-        ('model','10. Build and inspect the coarse-to-fine RSVT',
+        ('model','11. Build and inspect the coarse-to-fine RSVT',
          'Why: see parameters and compute. The 96³ view gives anatomy context and a router chooses K native-resolution crops; '
          'evidence is read only there. The table compares this with running the same encoder over the whole native volume.',
          'if session.has_store():\n    parameter_count = session.show_model()\n'),
-        ('training','11. Train and watch the epoch results',
+        ('training','12. Train and watch the epoch results',
          'Why: learn from training volumes and monitor validation volumes. Expected output: batch progress, an updating epoch '
          'table and learning curves. The first epochs train without tail risk; the checkpoint is chosen among risk-stage epochs '
-         'by validation balanced BCE. Checkpoints and logs save to Drive after every epoch; re-running resumes.',
+         'by the validation loss averaged over authentic, removal and insertion volumes. Checkpoints and logs save to Drive '
+         'after every epoch; re-running resumes.',
          'if RUN_TRAINING and session.has_store():\n    training_summary = session.train()\nelse:\n'
          '    print("Training not run in this execution. No training result is claimed.")\n'),
-        ('curves','12. Review the learning curves',
+        ('curves','13. Review the learning curves',
          'Why: compare training objective with validation loss and AUROCs. Falling training loss alone does not prove generalization.',
          'epoch_history = session.show_history()\n'),
-        ('results','13. Inspect the selected model’s results',
+        ('results','14. Inspect the selected model’s results',
          'Why: judge detection where it matters: removal (FB) and insertion (FM) against authentic scans, per generator, '
          'router recall (did the chosen crops contain the edit?) and mask overlap. Operating points are exploratory.',
          'selected_model_results = session.show_results()\n'),
-        ('test','14. Understand the held-out test set',
+        ('test','15. Understand the held-out test set',
          'Why: keep an independent final check. Test patients are not acquired or opened by this notebook.',
          'session.show_test_status()\n'),
-        ('saved','15. Verify that the results are saved',
+        ('saved','16. Verify that the results are saved',
          'Why: confirm Drive storage by reading files back against checksums. Expected output: **Saved and verified** and the session path.',
          'persistence_receipt = session.verify_saved()\nprint("To resume this session:", session.root)\n')]
     for name,title,description,code in sections:
@@ -181,23 +239,7 @@ def build():
     return result
 
 
-def prepare_release():
-    """Write the coarse-to-fine training release folder; earlier releases stay untouched."""
-    RELEASE_DIR.mkdir(parents=True,exist_ok=True)
-    bundle=build_bundle(ROOT,RELEASE_DIR/TRAINING_ARCHIVE,include_notebooks=False)
-    source=(ROOT/'scripts/notebook_support/m3d_training_bootstrap_template.py').read_text(encoding='utf-8')
-    text=(source.replace('__SOURCE_SHA256__',bundle['sha256']).replace('__RELEASE__',TRAINING_RELEASE)
-          .replace('__ARCHIVE__',TRAINING_ARCHIVE))
-    BOOTSTRAP.write_text(text,encoding='utf-8')
-    if BOOTSTRAP.read_text(encoding='utf-8')!=text: raise OSError('Bootstrap readback failed')
-    result={'release_folder_in_drive':TRAINING_RELEASE,'source_bundle':bundle,
-        'bootstrap_sha256':hashlib.sha256(BOOTSTRAP.read_bytes()).hexdigest(),
-        'review_release_unchanged':RELEASE,'review_runtime_sha256':hashlib.sha256(REVIEW_RUNTIME.read_bytes()).hexdigest(),
-        'frozen_review_backend_sha256':FROZEN_REVIEW_SHA,'notebooks':build()}
-    (RELEASE_DIR/'release.json').write_text(json.dumps(result,indent=2)+'\n',encoding='utf-8')
-    return result
-
-
 if __name__=='__main__':
-    parser=argparse.ArgumentParser(description=__doc__); parser.add_argument('--release',action='store_true')
-    args=parser.parse_args(); print(json.dumps(prepare_release() if args.release else build(),indent=2))
+    print(json.dumps({'notebooks':build(),'training_code_source':REPOSITORY,'review_release_unchanged':RELEASE,
+                      'review_runtime_sha256':hashlib.sha256(REVIEW_RUNTIME.read_bytes()).hexdigest(),
+                      'frozen_review_backend_sha256':FROZEN_REVIEW_SHA},indent=2))

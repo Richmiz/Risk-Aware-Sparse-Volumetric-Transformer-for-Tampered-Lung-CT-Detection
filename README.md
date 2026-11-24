@@ -55,6 +55,8 @@ The study trains and validates on M3Dsynth, which edits LIDC-IDRI scans with thr
 
 ## Running the study
 
-Open [`notebooks/01_RSVT_TRAINING.ipynb`](notebooks/01_RSVT_TRAINING.ipynb) in VS Code or Colab with a GPU runtime and mount Google Drive. The notebook shows the data plan, downloads and verifies the selected M3Dsynth samples and their LIDC-IDRI source series when `PREPARE_DATA = True`, runs resolution and shortcut checks, and trains the model. Data preparation and training resume after an interruption. The notebook loads the package from a checksum-verified code release in the project's Drive folder rather than from code in its cells.
+[Open `notebooks/01_RSVT_TRAINING.ipynb` in Colab](https://colab.research.google.com/github/Richmiz/Risk-Aware-Sparse-Volumetric-Transformer-for-Tampered-Lung-CT-Detection/blob/main/notebooks/01_RSVT_TRAINING.ipynb) and choose a GPU runtime. The notebook clones this repository at `CODE_REF` (default `main`) and saves the exact commit with each session. While the repository is private, store a read-only GitHub token for it as the Colab secret `GITHUB_TOKEN`.
+
+The notebook mounts Google Drive for the dataset store and the results. It shows the data plan, downloads and verifies the selected M3Dsynth samples and their LIDC-IDRI source series when `PREPARE_DATA = True`, runs resolution and shortcut checks, and trains the model. The M3Dsynth metadata tables are fetched from the authors' repository at a pinned commit and checked against recorded checksums. Data preparation and training resume after an interruption.
 
 Test patients from the publisher's partition are not downloaded or opened by data preparation, diagnostics, training, or model selection.

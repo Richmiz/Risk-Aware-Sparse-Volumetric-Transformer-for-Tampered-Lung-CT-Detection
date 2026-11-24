@@ -36,7 +36,7 @@ class M3DNotebookSession:
     def __init__(self, project, code_root, *, epochs=30, learning_rate=2e-4, patience=8, seed=13,
                  patients_train=200, patients_validation=60, generators=("cycle", "pix2pix", "diffusion"),
                  resume_session="", configuration=None, store_root=None, cache_root=None, work_root=None,
-                 lidc_root=None, metadata_dir=None, enforce_drive=True, display_enabled=True):
+                 lidc_root=None, metadata_dir=None, enforce_drive=True, display_enabled=True, code_commit=None):
         self.project, self.code_root = Path(project).resolve(), Path(code_root).resolve()
         if enforce_drive and (platform.system() != "Linux"
                               or not self.project.is_relative_to(Path("/content/drive/MyDrive").resolve())):
@@ -66,7 +66,7 @@ class M3DNotebookSession:
         if resume_session:
             stored = json.loads((self.root / "notebook_session.json").read_text(encoding="utf-8"))
             if stored["binding"] != binding:
-                raise ValueError("Resume needs the same settings and code release as the original session")
+                raise ValueError("Resume needs the same settings and code (CODE_REF) as the original session")
         else:
             self.root.mkdir(parents=True, exist_ok=False)
         self.training_dir, self.assets = self.root / "training", self.root / "figures"
@@ -74,8 +74,14 @@ class M3DNotebookSession:
         write_profile(self.root / "training_config.toml", self.config)
         self.artifacts, self._handles, self._history = {}, {}, []
         self._save_json("notebook_session.json", {"binding": binding, "store": str(self.store_root),
+                                                  "code_commit": code_commit,
                                                   "created_utc": datetime.now(timezone.utc).isoformat(),
                                                   "test_status": "not_acquired_reserved_for_final_evaluation"})
+        if metadata_dir is None:
+            # A GitHub checkout has no author tables: fetch them at the pinned commit (checksum-verified).
+            self.metadata_report = store_mod.fetch_metadata(self.metadata_dir)
+        # Without the audited UID map (kept out of the public repository) each series is found on
+        # TCIA by patient and series number and its headers are checked after download.
         uid_map = self.code_root / UID_MAP_RELATIVE
         self.meta = store_mod.load_metadata(self.metadata_dir, uid_map if uid_map.exists() and not metadata_dir else None)
         acquisition = self.config["acquisition"]

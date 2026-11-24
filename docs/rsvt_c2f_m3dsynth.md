@@ -123,11 +123,16 @@ accuracy, router recall@K and mask Dice on crops containing the site.
 
 ## Running it
 
-Open `notebooks/01_RSVT_TRAINING.ipynb` with a Colab GPU kernel. Review the data
-plan (section 5), set `PREPARE_DATA = True` to download and verify, then run the
-remaining sections. Data preparation and training both resume after interruption.
-The release folder `outputs/rsvt_training/release_20261117_m3dsynth_c2f/` must
-exist in Drive (see the delivery report).
+Open `notebooks/01_RSVT_TRAINING.ipynb` in Colab from GitHub with a GPU runtime.
+Section 3 clones the repository at `CODE_REF` and records the exact commit; while
+the repository is private it reads a read-only token from the Colab secret
+`GITHUB_TOKEN`. Section 4 fetches the M3Dsynth metadata tables at a pinned commit
+of the authors' repository and checks their SHA-256. Without the audited UID map,
+which stays out of the repository, each LIDC series is found on TCIA by patient
+and series number; on a sample of 30 series this gave the audited UID every time.
+Review the data plan (section 6), set `PREPARE_DATA = True` to download and verify,
+then run the remaining sections. Data preparation and training both resume after
+interruption.
 
 ## Limits
 

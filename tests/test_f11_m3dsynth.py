@@ -4,6 +4,7 @@ Procedural CT series and TIFF archives only; no medical images are read.
 """
 
 import csv
+import hashlib
 from io import BytesIO
 import json
 import math
@@ -12,6 +13,7 @@ import sys
 import tarfile
 from tempfile import TemporaryDirectory
 import unittest
+from unittest import mock
 
 import numpy as np
 from PIL import Image
@@ -192,6 +194,31 @@ class Conversion(unittest.TestCase):
         self.assertEqual(int(store_mod.authors_uint16(wrap)[0][0, 0, 1]), (32000 + 1024 - 65536) % 65536)
         with self.assertRaises(ValueError):
             store_mod.authors_uint16(np.zeros((1, 1, 1), np.float32))
+
+    def test_metadata_fetch_is_pinned_verified_and_kept(self):
+        payload = {name: f"{name} table".encode() for name in store_mod.METADATA_FILES}
+        pins = {name: (remote, hashlib.sha256(payload[name]).hexdigest())
+                for name, (remote, _) in store_mod.METADATA_FILES.items()}
+        urls = []
+
+        def fetch(url):
+            urls.append(url)
+            return payload[url.rsplit("/", 1)[-1]]
+
+        with TemporaryDirectory() as tmp, mock.patch.dict(store_mod.METADATA_FILES, pins):
+            folder = Path(tmp)
+            self.assertEqual(sorted(store_mod.fetch_metadata(folder, fetch=fetch)["fetched"]), sorted(pins))
+            self.assertTrue(all(f"/M3Dsynth/{store_mod.METADATA_COMMIT}/" in url for url in urls))
+            self.assertEqual(store_mod.fetch_metadata(folder, fetch=fetch)["fetched"], [])  # verified copies kept
+            (folder / "sets.csv").write_bytes(b"edited locally")
+            with self.assertRaisesRegex(ValueError, "differs from the audited copy"):
+                store_mod.fetch_metadata(folder, fetch=lambda url: b"tampered")
+            self.assertEqual((folder / "sets.csv").read_bytes(), b"edited locally")  # nothing replaced
+
+    @unittest.skipUnless((AUDITED_METADATA / "data.csv").is_file(), "local audited M3Dsynth metadata is not present")
+    def test_pinned_metadata_checksums_equal_the_audited_copies(self):
+        for name, (_, expected) in store_mod.METADATA_FILES.items():
+            self.assertEqual(store_mod.sha256_path(AUDITED_METADATA / name), expected, name)
 
     @unittest.skipUnless((AUDITED_METADATA / "data.csv").is_file() and AUDITED_UID_MAP.is_file(),
                          "local M3Dsynth metadata and audited series map are not present")
