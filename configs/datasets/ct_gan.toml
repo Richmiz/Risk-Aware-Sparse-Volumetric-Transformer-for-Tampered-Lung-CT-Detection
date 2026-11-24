@@ -1,0 +1,8 @@
+[dataset]
+name = "ct_gan"
+root = "data/raw/ct_gan"
+manifest = "data/manifests/ct_gan.csv"
+role = "four_class_forensic_benchmark"
+classes = ["TB", "TM", "FB", "FM"]
+annotation_policy = "verify_coordinates_and_any_masks_before_use"
+provenance_audit_required = true

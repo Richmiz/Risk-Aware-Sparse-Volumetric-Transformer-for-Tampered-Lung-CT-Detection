@@ -1,0 +1,19 @@
+[inventory]
+hash_files = true
+read_dicom_headers = true
+identity_key_file = "data/private/inventory_identity.key"
+
+[datasets.ct_gan]
+root = "data/raw/ct_gan"
+role = "forensic"
+source_url = "https://archive.ics.uci.edu/dataset/520"
+
+[datasets.m3dsynth]
+root = "data/raw/m3dsynth"
+role = "forensic"
+source_url = "https://github.com/grip-unina/M3Dsynth"
+
+[datasets.lidc_idri]
+root = "data/raw/lidc_idri"
+role = "anatomy_reference"
+source_url = "https://www.cancerimagingarchive.net/collection/lidc-idri/"

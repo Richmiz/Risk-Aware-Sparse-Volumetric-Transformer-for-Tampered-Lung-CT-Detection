@@ -1,0 +1,11 @@
+# Files are stored byte-for-byte, without line-ending conversion, because
+# release receipts and tests pin SHA-256 checksums of generated files.
+* -text
+*.png binary
+*.jpg binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.tgz binary
+*.pt binary
+*.dcm binary

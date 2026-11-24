@@ -1,0 +1,7 @@
+[dataset]
+name = "lidc_idri"
+root = "data/raw/lidc_idri"
+manifest = "data/manifests/lidc_idri.csv"
+role = "anatomy_reference"
+auto_assign_forensic_labels = false
+provenance_audit_required = true

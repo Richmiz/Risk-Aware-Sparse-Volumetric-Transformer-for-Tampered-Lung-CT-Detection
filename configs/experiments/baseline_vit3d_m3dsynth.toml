@@ -1,0 +1,8 @@
+extends = ["../base.toml", "../datasets/m3dsynth.toml", "../models/vit3d.toml"]
+
+[experiment]
+id = "B1_M3DSYNTH"
+name = "dense_vit3d_m3dsynth_baseline"
+protocol = "source_grouped"
+
+# Use the same audited manifest and partitions as the matching RSVT experiment.

@@ -1,0 +1,5 @@
+# Minimal F01 environment verified on Python 3.12; not the GPU training lockfile.
+pydicom==3.0.2
+stream-unzip==0.0.101
+stream-inflate==0.0.43
+pycryptodome==4.4.0

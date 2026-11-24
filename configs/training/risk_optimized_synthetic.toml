@@ -1,0 +1,14 @@
+extends = ["risk_synthetic.toml"]
+
+# RSVT software check only. No medical images or performance claims.
+[engineering]
+learning_rate = 0.0001
+
+[optimization]
+weight_decay = 0.0001
+exclude_norm_bias_decay = true
+lr_schedule = "warmup_cosine"
+# F07's logical batch loop steps once per iteration; unit = optimizer step.
+warmup_epochs = 1
+warmup_start_ratio = 0.1
+min_lr_ratio = 0.1

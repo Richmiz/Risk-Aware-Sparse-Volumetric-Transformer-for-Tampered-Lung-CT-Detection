@@ -1,0 +1,76 @@
+# Coarse-to-fine RSVT on M3Dsynth (17 Nov 2026). Exploratory engineering pilot:
+# hyperparameters are starting values, not selected on validation or test.
+
+[data]
+# Training generators; hold one out (e.g. remove "diffusion") for an unseen-generator test.
+generators = ["cycle", "pix2pix", "diffusion"]
+crop_mm = 48.0            # native crop extent; voxels per axis follow each series' spacing
+grid = 12                 # router cells per axis on the 96^3 coarse view (~25-37 mm cells)
+flip_probability = 0.5    # left-right, training only
+forced_sites = 1          # training crop at the author site (mask) or an authentic site
+random_crops = 4          # extra training crops in body cells (hard negatives / context)
+jitter_fraction = 0.25
+
+[acquisition]
+# Publisher patient partitions (train 488 / valid 100 / test 150 patients).
+# Patient caps keep Drive storage bounded; all sites and generators of a chosen
+# patient are kept together. Test stays unacquired until final evaluation.
+patients_train = 200
+patients_validation = 60
+patients_test = 0
+half_box_mm = 48.0        # stored box half-extent around each author manipulation centre
+seed = 13
+
+[model]
+dimension = 128
+heads = 4
+layers = 3
+dropout = 0.1
+coarse_widths = [16, 32, 64]
+fine_widths = [16, 32, 64]
+router_hidden = 64
+router_prior = 0.003      # initial cell probability (~5 of 1,728 cells)
+crops_at_inference = 16   # compute budget: native crops read per volume
+
+[training]
+mode = "engineering_pilot"
+device = "cuda"
+seed = 13
+threads = 2
+epochs = 30
+learning_rate = 0.0002
+weight_decay = 0.0001
+gradient_clip = 5.0
+patience = 8              # risk-stage epochs without validation improvement; 0 disables
+min_delta = 0.0001
+exclude_norm_bias_decay = true
+lr_schedule = "warmup_cosine"
+warmup_epochs = 2
+warmup_start_ratio = 0.1
+min_lr_ratio = 0.05
+authentic_per_batch = 4
+manipulated_per_batch = 12
+max_batches_per_epoch = 0 # 0 = every authentic training volume once per epoch
+router_crops_training = 8
+risk_start_epoch = 3
+
+[loss]
+volume = 1.0
+removal = 0.5
+crop_tamper = 0.5
+crop_visible = 0.25
+mask = 0.5
+router = 0.5
+router_pos_weight = 50.0
+
+[risk]
+alpha = 0.5               # empirical upper-tail fraction per group (provisional)
+cvar_weight = 0.3
+authentic_weight = 1.0    # highest-scoring authentic volumes (they set the threshold)
+fb_weight = 2.0           # worst missed removals
+fm_weight = 1.0           # worst missed insertions
+generator_weight = 0.1    # variance of per-generator loss within FB and FM
+min_generator_samples = 2
+
+[evaluation]
+fpr_targets = [0.05, 0.10]

@@ -1,0 +1,8 @@
+extends = ["../base.toml", "../datasets/m3dsynth.toml", "../models/rsvt.toml"]
+
+[experiment]
+id = "B5"
+name = "rsvt_full"
+protocol = "source_grouped"
+
+# Requires multiple verified training generators and an audited label mapping.

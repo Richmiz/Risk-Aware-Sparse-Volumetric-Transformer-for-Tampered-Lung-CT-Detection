@@ -1,0 +1,26 @@
+[engineering]
+scope = "synthetic_paired_ablation_and_cluster_statistics"
+device = "auto"
+threads = 2
+seeds = [13, 37]
+steps = 2
+sequence_caps = [64, 128, 256]
+read_medical_volumes = false
+allow_final_test = false
+
+[statistics]
+replicates = 1000
+seed = 113
+confidence_level = 0.95
+cluster_key = "source_group"
+method = "paired_whole_cluster_percentile"
+undefined_policy = "suppress_interval_if_any_undefined"
+noninferiority_margin = "PENDING"
+
+[profiling]
+warmup = 2
+iterations = 10
+stage_iterations = 3
+batch_size = 1
+case_index = 0
+timing_scope = "preloaded_FP32_forward_no_IO"

@@ -1,0 +1,21 @@
+extends = ["baseline_full.toml"]
+
+# Fitting control with FULL architectures and 96^3 grid on the fixed 8/4 subset.
+# Balanced subset removes class-weight imbalance; regularization is disabled.
+# Stop after two consecutive train-fit passes, or at 30 epochs (240 updates).
+# Source validation is monitoring/checkpoint selection only, not a stop signal.
+[training]
+epochs = 30
+patience = 30
+accumulation_steps = 1
+weight_decay = 0.0
+early_stopping = false
+stop_after_train_fit_epochs = 2
+diagnostic_logging = true
+
+[selection]
+train_per_class = 2
+validation_per_class = 1
+
+[models]
+dropout = 0.0

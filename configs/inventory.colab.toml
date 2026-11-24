@@ -1,0 +1,17 @@
+# Reference config. The notebook generates a run-specific copy for chosen storage.
+[inventory]
+hash_files = true
+read_dicom_headers = true
+identity_key_file = "private/inventory_identity.key"
+
+[datasets.ct_gan]
+root = "/content/rsvt-data/raw/ct_gan/uci/dataset"
+role = "forensic"
+
+[datasets.m3dsynth]
+root = "/content/rsvt-data/raw/m3dsynth"
+role = "forensic"
+
+[datasets.lidc_idri]
+root = "/content/rsvt-data/raw/lidc_idri"
+role = "anatomy_reference"

@@ -1,0 +1,26 @@
+extends = ["baseline_pilot.toml"]
+
+# Full F03 draft partitions (72 train / 14 validation); candidate targets.
+# Regularization restored after the train-fitting diagnostic. Best checkpoint
+# remains selected by unweighted source-validation CE; test pixels stay sealed.
+[training]
+epochs = 20
+patience = 5
+accumulation_steps = 4
+weight_decay = 0.0001
+early_stopping = true
+
+[representation]
+shape_zyx = [96, 96, 96]
+
+[selection]
+train_per_class = 0
+validation_per_class = 0
+
+[models]
+cnn_width = 64
+patch_size = 16
+dimension = 192
+layers = 4
+heads = 6
+dropout = 0.1

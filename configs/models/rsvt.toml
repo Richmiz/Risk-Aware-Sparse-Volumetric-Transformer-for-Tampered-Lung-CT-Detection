@@ -1,0 +1,20 @@
+[model]
+name = "rsvt"
+sparse_routing = true
+coarse_coverage = true
+multiscale_tokens = true
+forensic_anomaly_features = true
+hard_routing_at_inference = true
+
+[loss]
+class_balanced_classification = true
+class_conditional_cvar = true
+cvar_classes = ["FB", "FM"]
+cvar_alpha_candidates = [0.80, 0.90, 0.95]
+generator_regularization = true
+localization_with_verified_masks_only = true
+
+[compute]
+candidate_budget_profiles = ["low", "medium", "high"]
+include_controller_overhead = true
+report_measured_latency = true

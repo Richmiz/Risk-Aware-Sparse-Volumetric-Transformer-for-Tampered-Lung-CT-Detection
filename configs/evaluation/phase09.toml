@@ -1,0 +1,14 @@
+[evaluation]
+scope = "engineering_saved_synthetic_validation_only"
+ece_bins = 10
+demo_point_radius_mm = 5.0
+read_medical_volumes = false
+allow_final_test = false
+fit_probability_calibration = false
+
+[protocol]
+status = "draft"
+research_protocol_locked = false
+actual_LOGO_training = false
+independent_patient_inference = false
+matched_trained_model_profiling = false

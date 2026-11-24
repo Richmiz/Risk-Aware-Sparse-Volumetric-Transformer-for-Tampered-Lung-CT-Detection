@@ -1,0 +1,28 @@
+{
+  "schema": "ctgan_publisher_label_policy_v1",
+  "source": {
+    "readme_path": "Readme.docx",
+    "readme_sha256": "91da8903c128d9f175a4a815c497b835bb92ec5368195d8a3c691fa3e83dc671",
+    "paper_url": "https://arxiv.org/html/1901.03597v3#S6.SS1",
+    "repository_url": "https://github.com/ymirsky/CT-GAN"
+  },
+  "labels": {
+    "TB": {"authentic": true, "operation": "none", "meaning": "Publisher true-benign scan"},
+    "TM": {"authentic": true, "operation": "none", "meaning": "Publisher true-malign scan"},
+    "FB": {"authentic": false, "operation": "removal", "meaning": "Publisher scan with nodules removed"},
+    "FM": {"authentic": false, "operation": "insertion", "meaning": "Publisher scan with nodules inserted"}
+  },
+  "expected_scan_counts": {
+    "exp1": {"TB": 10, "TM": 10, "FB": 30, "FM": 30},
+    "exp2": {"TB": 5, "TM": 5, "FB": 5, "FM": 5}
+  },
+  "readme_slice_counts": {"exp1": 17941, "exp2": 5296},
+  "label_file_sha256": {
+    "exp1": "d05e1148cf58a4db84b1faf7dca248869dae8afe93f38902a8b4ccbc213abeed",
+    "exp2": "f16581fc9d705bafbea212809e2aba179a7bd53717c2890de6d2c4161f84999b"
+  },
+  "duplicate_policy": "Retain every source row; count each exact experiment/scan/class/slice/x/y tuple once for annotation accounting and each experiment/scan once for classification.",
+  "zero_policy": "All-zero TB rows are absent-location placeholders for authentic benign cases; they are never lesion points or masks. Other all-zero classes are rejected.",
+  "coordinate_policy": "Filename and bounds checks only. RadiAnt/CT-GAN axis conventions and index base still require image-space confirmation; no automatic xy swap or mask creation.",
+  "clinical_diagnosis_verified": false
+}

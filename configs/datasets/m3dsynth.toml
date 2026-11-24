@@ -1,0 +1,8 @@
+[dataset]
+name = "m3dsynth"
+root = "data/raw/m3dsynth"
+manifest = "data/manifests/m3dsynth.csv"
+role = "cross_generator_forensic_benchmark"
+annotation_policy = "verify_available_label_levels_and_masks"
+provenance_audit_required = true
+generator_ids_require_inventory = true

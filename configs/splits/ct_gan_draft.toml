@@ -1,0 +1,16 @@
+# Engineering draft; does not close source identity / annotation / preprocessing QA.
+[partition]
+seed = 13
+train = 0.70
+validation = 0.15
+test = 0.15
+label_rule = "unanimous_location_label_candidate"
+status = "engineering_draft"
+
+[loader]
+smoke_samples = 2
+max_decode_bytes = 3221225472
+max_batch_bytes = 2147483648
+flip_axes = []
+flip_probability = 0.0
+# Full field of view; no lesion-centered or label-conditioned crop.

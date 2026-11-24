@@ -1,0 +1,32 @@
+[entry]
+id = "B1"
+kind = "baseline"
+description = "Fixed-patch dense 3D ViT reference"
+synthetic_backend_supported = true
+medical_backend_enabled = false
+exact_reference_reproduction = false
+unsupported_reason = ""
+
+[model]
+family = "vit3d"
+dimension = 16
+layers = 1
+heads = 2
+cnn_width = 2
+patch_size = 8
+coarse_patch_size = 16
+candidate_patch_sizes = [4, 8, 16]
+sequence_cap = 64
+localization_head = false
+
+[objective]
+routing = false
+cvar = false
+generator_variance = false
+
+[controls]
+source_grouped = true
+patient_disjoint_required = true
+selection_partition = "validation"
+preprocessing_shared = true
+scope = "synthetic_adapter_not_paper_reproduction_or_matched_cost_claim"

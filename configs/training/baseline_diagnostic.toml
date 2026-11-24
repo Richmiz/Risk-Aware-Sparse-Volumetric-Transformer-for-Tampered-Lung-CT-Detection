@@ -1,0 +1,15 @@
+extends = ["baseline_pilot.toml"]
+
+# Train-fitting control on the SAME deterministic 8 train / 4 validation cases.
+# Fixed 40-epoch budget, at most 320 AdamW updates/model (AMP skips are reported).
+# Best baseline checkpoint still uses source-validation CE; the last-epoch
+# training-fit diagnostic is reported separately. No test pixels are opened.
+[training]
+epochs = 40
+accumulation_steps = 1
+weight_decay = 0.0
+patience = 40
+early_stopping = false
+
+[models]
+dropout = 0.0

@@ -1,0 +1,19 @@
+[entry]
+id = "E7"
+kind = "ablation"
+reference = "B5"
+description = "Repeated seeds/partitions and leakage audit"
+synthetic_backend_supported = false
+medical_backend_enabled = false
+exact_reference_reproduction = false
+unsupported_reason = "Final canonical groups, split policy and paired executor pending"
+
+[contrast]
+conditions = ["seeds", "partitions", "leakage_audit"]
+candidate_seeds = [13, 37, 73, 101, 137]
+candidate_sequence_caps = [64, 128, 256]
+split_unit = "source_volume_id"
+matched_partitions_required = true
+matched_preprocessing_required = true
+selection_partition = "validation"
+status = "design_only_not_executed"

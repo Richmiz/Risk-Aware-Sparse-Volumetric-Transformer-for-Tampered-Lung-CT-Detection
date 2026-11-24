@@ -1,0 +1,11 @@
+[model]
+name = "vit3d"
+sparse_routing = false
+coarse_coverage = false
+multiscale_tokens = false
+
+[loss]
+class_balanced_classification = true
+class_conditional_cvar = false
+generator_regularization = false
+localization_with_verified_masks_only = true

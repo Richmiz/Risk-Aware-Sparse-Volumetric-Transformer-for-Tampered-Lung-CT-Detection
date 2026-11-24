@@ -1,0 +1,17 @@
+# Engineering pilot only; final forensic preprocessing must be locked after source validation.
+[geometry]
+position_tolerance_mm = 0.05
+direction_tolerance = 0.0001
+spacing_relative_tolerance = 0.01
+max_input_voxels = 300000000
+
+[preprocessing]
+target_spacing_xyz_mm = [1.0, 1.0, 1.0]
+hu_window = [-1000.0, 400.0]
+background_hu = -1024.0
+max_output_voxels = 300000000
+save_native_hu = true
+
+[annotations]
+slice_reference = "numeric_filename"
+xy_index_base = 0

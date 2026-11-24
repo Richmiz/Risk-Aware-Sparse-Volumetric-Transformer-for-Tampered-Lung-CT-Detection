@@ -1,0 +1,13 @@
+extends = ["baseline_full_diagnostic.toml"]
+
+# Same 8/4 fitting control, architectures, 96^3 grid and 30-epoch ceiling.
+# No augmentation or annotation-selected crops. Check optimization first.
+[training]
+device = "cuda"
+learning_rate = 0.0001
+gradient_clip = 5.0
+lr_schedule = "warmup_cosine"
+warmup_epochs = 3
+warmup_start_ratio = 0.1
+min_lr_ratio = 0.1
+exclude_norm_bias_decay = true

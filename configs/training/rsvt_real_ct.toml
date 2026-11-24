@@ -1,0 +1,66 @@
+[training]
+mode = "engineering_pilot"
+candidate_targets_acknowledged = true
+device = "cuda"
+seed = 13
+threads = 2
+epochs = 30
+logical_batch_size = 16
+learning_rate = 0.0001
+weight_decay = 0.0001
+gradient_clip = 5.0
+patience = 10
+min_delta = 0.0001
+exclude_norm_bias_decay = true
+lr_schedule = "warmup_cosine"
+warmup_epochs = 3
+warmup_start_ratio = 0.1
+min_lr_ratio = 0.1
+
+[data]
+expected_assignment_sha256 = "96098c998851686609b4ae9c0919bc3bdc2e3d9dd59e88a7330a95b6f61fddc6"
+shape_zyx = [96, 96, 96]
+train_per_class = 0
+validation_per_class = 0
+max_decode_bytes = 3221225472
+
+[model]
+dimension = 96
+heads = 4
+layers = 2
+coarse_width = 8
+candidate_width = 16
+coarse_patch_size = 32
+patch_sizes = [8, 16, 32]
+dropout = 0.1
+localization_head = false
+max_tokens = 2048
+max_batch_voxels = 2097152
+max_attention_elements = 33554432
+max_feature_grid_voxels = 8388608
+router_hidden = 32
+temperature = 1.0
+sequence_cap = 128
+# 17 Nov 2026 review fixes (legacy defaults remain in code for F05-F10 history):
+# keep max as well as mean per patch, start gates at the budget (100 of 1,971
+# candidates), and keep the same log-gate bias for packed tokens at inference.
+token_pooling = "max_mean"
+router_initial_keep_fraction = 0.0507
+hard_gate_bias = true
+
+[risk]
+# Provisional empirical-tail setting, not selected on test or proven optimal.
+alpha = 0.5
+cvar_weight = 0.2
+fb_weight = 2.0
+fm_weight = 1.0
+min_class_samples = 4
+
+[stages]
+baseline_epochs = 3
+routing_warmup_epochs = 2
+
+[dual]
+initial = 0.1
+learning_rate = 0.05
+maximum = 10.0

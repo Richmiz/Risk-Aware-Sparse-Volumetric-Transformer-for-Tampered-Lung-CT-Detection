@@ -1,0 +1,10 @@
+extends = ["../base.toml", "../datasets/ct_gan.toml", "../models/rsvt.toml"]
+
+[experiment]
+id = "RSVT_CTGAN_PILOT"
+name = "rsvt_ct_gan_pilot"
+protocol = "source_grouped"
+
+# No multi-generator penalty is assumed for the CT-GAN pilot.
+[loss]
+generator_regularization = false

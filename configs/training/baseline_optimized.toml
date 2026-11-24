@@ -1,0 +1,16 @@
+extends = ["baseline_full.toml"]
+
+# Separate exploratory optimization run; preserve historical inputs and splits.
+# Provisional settings, not a claim that validation performance improves.
+[training]
+device = "cuda"
+learning_rate = 0.0001
+epochs = 30
+patience = 10
+gradient_clip = 5.0
+diagnostic_logging = true
+lr_schedule = "warmup_cosine"
+warmup_epochs = 3
+warmup_start_ratio = 0.1
+min_lr_ratio = 0.1
+exclude_norm_bias_decay = true

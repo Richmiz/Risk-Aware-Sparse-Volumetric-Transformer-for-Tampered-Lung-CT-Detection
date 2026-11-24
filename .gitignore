@@ -1,0 +1,46 @@
+# This repository uses an allowlist: everything is ignored unless listed below,
+# so a new local file cannot be published by accident. Working notes (private/),
+# run reports, release bundles, outputs, datasets, the notebook archive and
+# AGENTS.md stay on disk and out of git.
+/*
+!/.editorconfig
+!/.gitattributes
+!/.gitignore
+!/CITATION.cff
+!/LICENSE
+!/README.md
+!/pyproject.toml
+!/configs/
+!/docs/
+!/requirements/
+!/scripts/
+!/src/
+!/tests/
+
+# The Colab training notebook is published; the annotation-review notebook and
+# the notebook archive are not.
+!/notebooks/
+/notebooks/*
+!/notebooks/01_RSVT_TRAINING.ipynb
+
+# The frozen annotation-review backend stays local with its notebook.
+/scripts/notebook_support/annotation_review_runtime.py
+
+# Dataset instructions and public source metadata are published; datasets,
+# derived metadata and keys are not.
+!/data/
+/data/*
+!/data/README.md
+!/data/public_sources.json
+!/data/manifests/
+/data/manifests/*
+!/data/manifests/manifest.template.csv
+
+# Generated files inside published folders
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/

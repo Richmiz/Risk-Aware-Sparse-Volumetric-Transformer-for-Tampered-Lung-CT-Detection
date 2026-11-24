@@ -1,0 +1,19 @@
+[entry]
+id = "E1"
+kind = "ablation"
+reference = "B5"
+description = "Fixed versus adaptive multiscale candidate selection"
+synthetic_backend_supported = false
+medical_backend_enabled = false
+exact_reference_reproduction = false
+unsupported_reason = "Single-scale paired executor and capacity controls pending"
+
+[contrast]
+conditions = ["fixed_scale", "multiscale_adaptive"]
+candidate_seeds = [13, 37, 73, 101, 137]
+candidate_sequence_caps = [64, 128, 256]
+split_unit = "source_volume_id"
+matched_partitions_required = true
+matched_preprocessing_required = true
+selection_partition = "validation"
+status = "design_only_not_executed"

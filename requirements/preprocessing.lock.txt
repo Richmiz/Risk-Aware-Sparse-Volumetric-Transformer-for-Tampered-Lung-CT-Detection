@@ -1,0 +1,5 @@
+# F02 minimal environment tested with synthetic data on Python 3.12.
+# Capture the actual Colab environment separately on each remote run.
+pydicom==3.0.2
+numpy==2.5.4
+SimpleITK==2.5.7

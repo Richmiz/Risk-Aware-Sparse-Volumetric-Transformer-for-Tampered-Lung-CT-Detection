@@ -1,0 +1,39 @@
+[training]
+mode = "engineering_pilot"
+candidate_targets_acknowledged = true
+seed = 13
+epochs = 3
+batch_size = 1
+accumulation_steps = 4
+learning_rate = 0.0003
+weight_decay = 0.0001
+patience = 3
+min_delta = 0.0001
+gradient_clip = 1.0
+threads = 2
+device = "auto"
+mixed_precision = true
+early_stopping = true
+train_fit_accuracy = 0.95
+train_fit_max_loss = 0.2
+stop_after_train_fit_epochs = 0
+diagnostic_logging = false
+
+[representation]
+shape_zyx = [64, 64, 64]
+max_decode_bytes = 3221225472
+policy = "full_fov_linear_image_nearest_validity"
+
+[selection]
+expected_assignment_sha256 = "96098c998851686609b4ae9c0919bc3bdc2e3d9dd59e88a7330a95b6f61fddc6"
+train_per_class = 2
+validation_per_class = 1
+
+[models]
+names = ["resnet50_3d", "vit3d"]
+cnn_width = 16
+patch_size = 8
+dimension = 96
+layers = 2
+heads = 4
+dropout = 0.1

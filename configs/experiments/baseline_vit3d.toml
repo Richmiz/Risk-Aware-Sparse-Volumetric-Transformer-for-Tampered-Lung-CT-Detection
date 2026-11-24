@@ -1,0 +1,6 @@
+extends = ["../base.toml", "../datasets/ct_gan.toml", "../models/vit3d.toml"]
+
+[experiment]
+id = "B1"
+name = "dense_vit3d_baseline"
+protocol = "source_grouped"

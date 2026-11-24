@@ -1,0 +1,32 @@
+[entry]
+id = "B2"
+kind = "baseline"
+description = "Small-region local-global two-stage cascade"
+synthetic_backend_supported = false
+medical_backend_enabled = false
+exact_reference_reproduction = false
+unsupported_reason = "Two-stage cascade not implemented; no substituted baseline"
+
+[model]
+family = "two_stage_cascade"
+dimension = 16
+layers = 1
+heads = 2
+cnn_width = 2
+patch_size = 8
+coarse_patch_size = 16
+candidate_patch_sizes = [4, 8, 16]
+sequence_cap = 64
+localization_head = false
+
+[objective]
+routing = false
+cvar = false
+generator_variance = false
+
+[controls]
+source_grouped = true
+patient_disjoint_required = true
+selection_partition = "validation"
+preprocessing_shared = true
+scope = "synthetic_adapter_not_paper_reproduction_or_matched_cost_claim"

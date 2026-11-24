@@ -1,0 +1,9 @@
+extends = ["../base.toml", "../datasets/m3dsynth.toml", "../models/rsvt.toml"]
+
+[experiment]
+id = "B5_LOGO"
+name = "rsvt_leave_one_generator_out"
+protocol = "leave_one_generator_out"
+held_out_generator_id = "UNSET"
+
+# Replace UNSET using the audited generator inventory, then rotate all generators.

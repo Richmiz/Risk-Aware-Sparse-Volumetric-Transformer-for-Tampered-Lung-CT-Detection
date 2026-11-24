@@ -1,0 +1,58 @@
+[engineering]
+scope = "synthetic_only"
+device = "auto"
+threads = 2
+seeds = [13]
+shape_zyx = [32, 32, 32]
+steps = 2
+learning_rate = 0.0003
+execute_ids = ["B0", "B1", "B3", "B4", "B5"]
+
+[catalog]
+baselines = ["../experiments/registry/B0.toml", "../experiments/registry/B1.toml", "../experiments/registry/B2.toml", "../experiments/registry/B3.toml", "../experiments/registry/B4.toml", "../experiments/registry/B5.toml"]
+ablations = ["../ablations/E1.toml", "../ablations/E2.toml", "../ablations/E3.toml", "../ablations/E4.toml", "../ablations/E5.toml", "../ablations/E6.toml", "../ablations/E7.toml"]
+
+[demo_policy]
+target_fpr = 0.05
+score = "p_FB_plus_p_FM"
+comparison = "strict_gt"
+checkpoint_selection = "minimum_unweighted_source_validation_CE"
+scope = "procedural_interface_check_not_research_selected_FPR"
+
+[demo_loss]
+alpha = 0.9
+fb_weight = 2.0
+fm_weight = 1.0
+min_class_samples = 4
+min_group_samples = 1
+cvar_weight = 0.2
+generator_weight = 0.1
+localization_weight = 0.0
+
+[demo_dual]
+initial = 0.1
+learning_rate = 0.05
+maximum = 10.0
+
+[research_protocol]
+status = "draft"
+selection_partition = "source_validation_only"
+test_used_for_tuning = false
+primary_contrast_proposed = "B5_vs_B1"
+split_unit = "source_volume_id"
+bootstrap_unit_proposed = "source_volume_id"
+bootstrap_replicates_proposed = 1000
+confidence_level_proposed = 0.95
+target_fpr = "PENDING"
+threshold_rule = "PENDING"
+checkpoint_selection = "PENDING"
+volume_aggregation = "PENDING"
+alpha_and_risk_weights = "PENDING"
+compute_budgets_and_hardware = "PENDING"
+noninferiority_margin = "PENDING"
+localization_radius_mm = "PENDING"
+generator_holdout_and_shift_policy = "PENDING"
+canonical_identity_and_label_QA = "PENDING"
+preprocessing_and_annotation_QA = "PENDING"
+baseline_quality_and_capacity_controls = "PENDING"
+paired_statistical_analysis = "PENDING"

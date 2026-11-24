@@ -1,0 +1,37 @@
+{
+  "verified_date": "2026-11-09",
+  "execution_policy": "Google Colab through VS Code; no further local dataset downloads",
+  "selection": "Official public sources selected; Kaggle mirrors were not verified for source lineage and forensic labels during this search.",
+  "datasets": {
+    "ct_gan": {
+      "landing_page": "https://archive.ics.uci.edu/dataset/520",
+      "download_url": "https://archive.ics.uci.edu/static/public/520/deepfakes%2Bmedical%2Bimage%2Btamper%2Bdetection.zip",
+      "license_as_listed": "CC BY 4.0; retain the license supplied inside the archive",
+      "annotation_level": "location labels and slice/x/y coordinates",
+      "local_acquisition": "pilot_prefix_only",
+      "full_archive_acquired": false
+    },
+    "m3dsynth": {
+      "landing_page": "https://grip-unina.github.io/M3Dsynth/",
+      "repository": "https://github.com/grip-unina/M3Dsynth",
+      "metadata_base": "https://raw.githubusercontent.com/grip-unina/M3Dsynth/main/data/",
+      "archive_index": "https://www.grip.unina.it/download/prog/M3Dsynth/",
+      "license_url": "https://www.grip.unina.it/download/prog/M3Dsynth/LICENSE.txt",
+      "license_as_listed": "Informational and nonprofit use, preserve notices, attribute authors",
+      "local_acquisition": "official_metadata_only",
+      "pixel_archive_probe": "HTTP 502 during the 2026-11-09 acquisition attempt",
+      "archives": {
+        "cycle": {"url": "https://www.grip.unina.it/download/prog/M3Dsynth/cycle.tgz", "size_display": "171G", "publisher_md5": "57ae4bb775e7f0c0acb42021836c8b3b"},
+        "diffusion": {"url": "https://www.grip.unina.it/download/prog/M3Dsynth/diffusion.tgz", "size_display": "161G", "publisher_md5": "b98e8bbfad5c685a7cf18e952a4e82cb"},
+        "pix2pix": {"url": "https://www.grip.unina.it/download/prog/M3Dsynth/pix2pix.tgz", "size_display": "142G", "publisher_md5": "603e2546ae63a26c11d5bad43c3ae46f"}
+      },
+      "full_archives_acquired": false
+    },
+    "lidc_idri": {
+      "landing_page": "https://www.cancerimagingarchive.net/collection/lidc-idri/",
+      "doi": "https://doi.org/10.7937/K9/TCIA.2015.LO9QL9SX",
+      "role": "authentic anatomy reference; shares source CT with M3Dsynth",
+      "local_acquisition": "not_downloaded"
+    }
+  }
+}
