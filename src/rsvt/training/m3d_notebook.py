@@ -271,9 +271,13 @@ class M3DNotebookSession:
                                       seed=self.config["training"]["seed"], progress=report)
         number = lambda v: "—" if v is None else f"{v:.3f}"
         identity = shortcut["archive_identity"]
+        per_operation = [(f"{op.capitalize()} AUROC, native / degraded to 96³ voxels",
+                          f"{number(arm['native'])} / {number(arm['coarse_equivalent'])}")
+                         for op, arm in resolution["by_operation"].items()]
         self._html("<h3>Pre-training checks (train/validation only)</h3>" + table_html(["Check", "Result"], [
-            ("Native-crop AUROC (paired manipulated vs authentic)", number(resolution["native"]["validation_auroc"])),
+            ("Native-crop AUROC (manipulated vs matched authentic site)", number(resolution["native"]["validation_auroc"])),
             ("Same crops degraded to the 96³ voxel size", number(resolution["coarse_equivalent"]["validation_auroc"])),
+            *per_operation,
             ("Resolution conclusion", resolution["interpretation"]),
             ("Eligible manipulated volumes / receipts", f"{identity['eligible']} / {identity['manipulated_receipts']}"),
             ("Changed voxels outside stored boxes (eligible)", identity["eligible_changed_voxels_outside_box"]),
@@ -297,7 +301,8 @@ class M3DNotebookSession:
                 ("Risk stage starts", f"epoch {t['risk_start_epoch'] + 1}"),
                 ("Tail risk (alpha / weight)", f"{r['alpha']} / {r['cvar_weight']}: authentic {r['authentic_weight']}, FB {r['fb_weight']}, FM {r['fm_weight']}"),
                 ("Generator-variance weight", r["generator_weight"]),
-                ("Checkpoint selection", "lowest validation balanced volume BCE among risk-stage epochs"),
+                ("Checkpoint selection", "lowest validation volume BCE averaged over authentic, removal and insertion "
+                                         "(risk-stage epochs)"),
                 ("Early stopping", f"{t['patience']} risk-stage epochs without improvement" if t["patience"] else "off"),
                 ("Seed / precision", f"{t['seed']} / FP32")]
         self._html(table_html(["Setting", "Value"], rows))
@@ -325,10 +330,10 @@ class M3DNotebookSession:
 
     def _history_html(self, rows):
         number = lambda v, p=False: "—" if v is None else (f"{100 * v:.1f}%" if p else f"{v:.4f}")
-        return table_html(["Epoch", "Stage", "LR", "Train objective", "Val balanced BCE", "Tamper AUROC", "Removal AUROC",
+        return table_html(["Epoch", "Stage", "LR", "Train objective", "Val selection BCE", "Tamper AUROC", "Removal AUROC",
                            "Worst-generator AUROC", "Router recall@K", "Removal recall @10% FPR"],
                           [[r["epoch"], r["stage"], f"{r['learning_rate']:.2g}", number(r["training_objective"]),
-                            number(r["validation_balanced_bce"]), number(r["validation_tamper_auroc"]),
+                            number(r["validation_selection_bce"]), number(r["validation_tamper_auroc"]),
                             number(r["validation_removal_auroc"]), number(r["validation_worst_generator_auroc"]),
                             number(r["validation_router_recall"], True), number(r["validation_removal_recall_fpr10"], True)]
                            for r in rows])
@@ -338,7 +343,8 @@ class M3DNotebookSession:
         figure, axes = plt.subplots(1, 2, figsize=(11, 3.6))
         epochs = [r["epoch"] for r in rows]
         axes[0].plot(epochs, [r["training_objective"] for r in rows], marker="o", label="Train objective")
-        axes[0].plot(epochs, [r["validation_balanced_bce"] for r in rows], marker="o", label="Validation balanced BCE")
+        axes[0].plot(epochs, [r["validation_selection_bce"] for r in rows], marker="o",
+                     label="Validation BCE (authentic / removal / insertion balanced)")
         for key, label in (("validation_tamper_auroc", "Tamper AUROC"), ("validation_removal_auroc", "Removal AUROC"),
                            ("validation_worst_generator_auroc", "Worst-generator AUROC")):
             axes[1].plot(epochs, [np.nan if r[key] is None else r[key] for r in rows], marker="o", label=label)

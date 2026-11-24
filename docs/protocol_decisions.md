@@ -82,6 +82,17 @@ Diperbarui: **13 November 2026**. Status keputusan mengikuti bukti saat ini.
 | Checkpoint selection | Set | Lowest validation balanced volume BCE among risk-stage epochs (hard top-K inference) |
 | Operating points | Exploratory | Thresholds at 5%/10% FPR are set on the same validation authentic volumes; a frozen endpoint protocol remains PENDING |
 
+## Amendment 24 November 2026 — pre-run review fixes
+
+Made before any M3Dsynth image was downloaded or any model trained.
+
+| Decision | Status | Rule |
+|---|---|---|
+| Volume-loss class weights | Corrected | Weights follow the logical-batch composition (4 authentic + 12 manipulated carry equal total weight). Dataset-level weights applied on top of the fixed batch composition had given the authentic class 78% of the volume loss |
+| Router candidate cells | Corrected | Candidates come from the body-intensity test on the image only. True cells are still router-loss positives but are never added as candidates; validation previously added them from the mask |
+| Checkpoint selection | Changed (supersedes 17 Nov) | Lowest validation volume BCE averaged over three equal groups (authentic, removal, insertion) among risk-stage epochs (hard top-K inference). The two-class balanced BCE is still reported |
+| Resolution check | Changed | Manipulated crops at declared site centres vs authentic sites of the same appearance (removal vs TB, insertion vs TM); results per operation. Pairing with the same location compared nodule vs no nodule |
+
 Kelanjutan QA 13 November: run `qa_20261113T005049_219029Z` telah direview dari
 Drive. Semua 103 file metadata cocok checksum; 300 hash header sampel cocok F01;
 123 preview tercatat (110 train/13 validation), 25 titik test dikecualikan.

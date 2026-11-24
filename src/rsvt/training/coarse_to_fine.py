@@ -132,7 +132,7 @@ def case_terms(model, case, device, config, *, train, selection=None):
     cell_target = torch.from_numpy(case.cell_target).to(device)
     router = F.binary_cross_entropy_with_logits(coarse["router_logits"], cell_target, reduction="none",
                                                 pos_weight=torch.tensor(loss_cfg["router_pos_weight"], device=device))
-    terms["router"] = router[valid_cells].mean()
+    terms["router"] = router[torch.from_numpy(case.router_cells).to(device)].mean()
     outputs = {}
     if not train:
         with torch.no_grad():
@@ -156,10 +156,19 @@ def case_terms(model, case, device, config, *, train, selection=None):
 # --------------------------------------------------------------------------- objective
 
 
-def class_weights(dataset):
-    counts = Counter(v["kind"] for v in dataset.rows)
-    total = sum(counts.values())
-    return {kind: total / (2. * counts[kind]) for kind in ("authentic", "manipulated")}
+def class_weights(config):
+    """Per-case volume-loss weights giving both classes equal total weight in a logical batch.
+
+    `epoch_batches` already fixes each batch at `authentic_per_batch` authentic and
+    `manipulated_per_batch` manipulated volumes, so the weights follow that composition.
+    Dataset-level counts must not be applied on top: with 200 authentic and 2,072
+    manipulated training volumes and 4+12 batches they gave the authentic class 78%
+    of the volume loss (review of 24 Nov 2026).
+    """
+    t = config["training"]
+    total = t["authentic_per_batch"] + t["manipulated_per_batch"]
+    return {"authentic": total / (2. * t["authentic_per_batch"]),
+            "manipulated": total / (2. * t["manipulated_per_batch"])}
 
 
 def objective(probes, metas, config, weights, *, risk_active):
@@ -293,6 +302,13 @@ def volume_metrics(rows, fpr_targets):
         losses[r["kind"]].append(r["volume_loss"])
     out["balanced_volume_bce"] = float(np.mean([np.mean(v) for v in losses.values()])) if losses else None
     out["volume_bce"] = float(np.mean([r["volume_loss"] for r in rows])) if rows else None
+    # Checkpoint selection balances authentic, removal and insertion equally; pooling the
+    # manipulated volumes let insertions (707 vs 214 removals by default) decide it.
+    groups = defaultdict(list)
+    for r in rows:
+        groups["authentic" if r["kind"] == "authentic" else r["operation"]].append(r["volume_loss"])
+    out["group_volume_bce"] = {g: float(np.mean(v)) for g, v in sorted(groups.items())}
+    out["group_balanced_volume_bce"] = float(np.mean([np.mean(v) for v in groups.values()])) if groups else None
     operating = {}
     for target in fpr_targets:
         threshold = _threshold([r["tamper_probability"] for r in authentic], target)
@@ -348,7 +364,7 @@ def fit(model, train, validation, config, output_dir, contract, *, resume=False,
     model.to(device)
     optimizer = build_optimizer(model, t)
     scheduler = build_scheduler(optimizer, t)
-    weights = class_weights(train)
+    weights = class_weights(config)
     binding = digest_json(contract)
     history, best, bad, start, best_epoch = [], math.inf, 0, 0, None
     if resume:
@@ -374,7 +390,7 @@ def fit(model, train, validation, config, output_dir, contract, *, resume=False,
                 progress({"event": "logical_batch", "epoch": epoch + 1, "batch": number, "batches": len(batches),
                           "objective": steps[-1]["objective"], "risk_active": risk_active})
         metrics, predictions = evaluate(model, validation, device, config, progress=progress)
-        score = metrics["balanced_volume_bce"]
+        score = metrics["group_balanced_volume_bce"]
         eligible = risk_active
         improved = eligible and score < best - t["min_delta"]
         if improved:
@@ -385,7 +401,8 @@ def fit(model, train, validation, config, output_dir, contract, *, resume=False,
         row = {"epoch": epoch + 1, "stage": "risk" if risk_active else "warmup", "checkpoint_eligible": eligible,
                "learning_rate": optimizer.param_groups[0]["lr"], "optimizer_steps": len(steps),
                "training_objective": float(np.mean([s["objective"] for s in steps])), **{"train_" + k: v for k, v in mean_terms.items()},
-               "validation_balanced_bce": score, "validation_tamper_auroc": metrics["tamper_auroc"],
+               "validation_selection_bce": score, "validation_balanced_bce": metrics["balanced_volume_bce"],
+               "validation_tamper_auroc": metrics["tamper_auroc"],
                "validation_removal_auroc": metrics["removal_auroc"], "validation_worst_generator_auroc": metrics["worst_generator_auroc"],
                "validation_router_recall": metrics.get("router_recall_at_k"),
                "validation_removal_recall_fpr10": metrics["operating_points"].get("fpr_0.1", {}).get("removal_recall"),
@@ -417,7 +434,8 @@ def fit(model, train, validation, config, output_dir, contract, *, resume=False,
                "epochs_completed": last, "training_finished": last >= t["epochs"] or bool(t["patience"] and bad >= t["patience"]),
                "best_epoch": best_epoch, "reported_checkpoint_epoch": state["epoch"],
                "checkpoint_stage": "risk" if best_epoch else "provisional_warmup_or_last",
-               "selection_rule": "minimum validation balanced volume BCE among risk-stage epochs (hard top-K inference)",
+               "selection_rule": ("minimum validation volume BCE averaged over authentic, removal and insertion "
+                                  "among risk-stage epochs (hard top-K inference)"),
                "train_volumes": dict(Counter(v["kind"] for v in train.rows)),
                "validation_volumes": dict(Counter(v["kind"] for v in validation.rows)),
                "class_weights": weights, "validation_metrics": metrics, "history": history,

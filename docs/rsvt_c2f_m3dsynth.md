@@ -63,7 +63,9 @@ acquired. Change `PATIENTS_TRAIN` / `PATIENTS_VALIDATION` in the notebook.
 * **Native crops**: ≈48 mm on the native voxel grid (z 16–64, y/x 32–96 voxels,
   multiples of 8), the box pasted in, no resampling.
 * **Cells**: a 12³ grid over the coarse view (≈25–37 mm cells). Cells overlapping
-  the author mask are router targets.
+  the author mask are router targets. Router candidates are the cells that pass a
+  body-intensity test on the image alone; the label adds supervised positives but
+  never candidates, in training or validation.
 
 ## Model
 
@@ -86,7 +88,8 @@ convolutions, so CUDA backward stays deterministic.
 
 ## Objective
 
-Per volume: volume tamper BCE (class-weighted), removal-vs-insertion BCE
+Per volume: volume tamper BCE (weighted so that the 4 authentic and 12 manipulated
+volumes of a batch carry equal total weight), removal-vs-insertion BCE
 (manipulated only), crop tamper BCE, visible-nodule BCE (site crops), mask
 BCE+Dice and router BCE (positive weight 50). From epoch 4 a **tail-risk term**
 adds the empirical CVaR (α = 0.5) of the volume tamper loss within three groups:
@@ -96,8 +99,9 @@ authentic + 12 manipulated volumes, stratified by generator × operation; the
 batch objective is differentiated in scalar space and each volume is replayed
 with its recorded RNG and crop selection (tested equal to direct backprop).
 
-Checkpoint selection: lowest validation balanced volume BCE among risk-stage
-epochs, using hard top-K inference. Validation metrics: tamper AUROC, removal and
+Checkpoint selection: lowest validation volume BCE averaged over three equal groups
+(authentic, removal, insertion) among risk-stage epochs, using hard top-K
+inference. Validation metrics: tamper AUROC, removal and
 insertion AUROC, per-generator and worst-generator AUROC, removal/insertion recall
 at 5% and 10% authentic FPR (exploratory thresholds), removal-vs-insertion
 accuracy, router recall@K and mask Dice on crops containing the site.
@@ -106,10 +110,14 @@ accuracy, router recall@K and mask Dice on crops containing the site.
 
 `src/rsvt/experiments/m3d_diagnostics.py`, train/validation only:
 
-* **Resolution check**: paired crops at each manipulation centre (manipulated vs
-  the same location in the authentic series), one small CNN trained at native
-  resolution and one on the same crops degraded to the 96³ voxel size. Reports
-  both validation AUROCs and the gap, overall and per generator × operation.
+* **Resolution check**: each manipulated crop (at its declared site centre) is
+  paired with an authentic site of the same appearance: removals with TB sites (no
+  nodule in either crop), insertions with TM sites (a nodule in both), from the same
+  series when available. One small CNN is trained at native resolution and one on
+  the same crops degraded to the 96³ voxel size. Reports both validation AUROCs and
+  the gap, overall, per operation and per generator × operation. It tests whether
+  the evidence at a known site survives coarse voxels, not whether the router can
+  find the site.
 * **Shortcut check**: archive identity outside boxes, whether edits extend beyond
   the author mask box, and a whole-scan histogram classifier (expected ≈0.5).
 

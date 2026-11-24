@@ -240,6 +240,7 @@ class VolumeCase:
         if cz % g or cy % g or cx % g:
             raise ValueError("Coarse view must divide into the cell grid")
         blocks = self.coarse.reshape(g, cz // g, g, cy // g, g, cx // g).mean(axis=(1, 3, 5))
+        # Router candidates come from the image alone, in training and at inference alike.
         self.cell_valid = (blocks > body_threshold).reshape(-1)
         idx = np.stack(np.meshgrid(*[np.arange(g)] * 3, indexing="ij"), -1).reshape(-1, 3)
         self.cell_index = idx
@@ -258,8 +259,11 @@ class VolumeCase:
             last = np.floor((hi_v + .5) * g / np.asarray(self.native_shape)).astype(int).clip(0, g - 1)
             hits = np.all((idx >= first) & (idx <= last), axis=1)
             self.cell_target[hits] = 1.
-            self.cell_valid |= hits
             self.site_center = (lo_v + hi_v) / 2.
+        # Cells supervised by the router loss: every true cell is a positive even when it
+        # fails the body test, but the label never adds selection candidates (that leaked
+        # the answer into validation routing; review of 24 Nov 2026).
+        self.router_cells = self.cell_valid | (self.cell_target > 0)
         jitter = np.asarray(self.crop_shape, dtype=float) * jitter_fraction
         self.forced = []
         if forced:

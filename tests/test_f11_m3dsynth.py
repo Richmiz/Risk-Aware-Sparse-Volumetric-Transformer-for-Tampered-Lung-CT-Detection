@@ -21,7 +21,8 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from rsvt.data import m3dsynth_store as store_mod
-from rsvt.data.m3dsynth_dataset import AreaResampler, M3DDataset, M3DStore, coarse_builder, intensity_lut
+from rsvt.data.m3dsynth_dataset import (AreaResampler, M3DDataset, M3DStore, VolumeCase, _rng, coarse_builder,
+                                        intensity_lut)
 from rsvt.losses.endpoint_risk import dice_bce, generator_variance, grouped_tail_risk
 from rsvt.models.coarse_to_fine import CoarseToFineRSVT, compute_estimate
 from rsvt.training import coarse_to_fine as trainer
@@ -226,6 +227,20 @@ class StoreAndDataset(unittest.TestCase):
         gc.collect()
         cls.tmp.cleanup()
 
+    def test_router_candidates_never_come_from_the_label(self):
+        volume = next(v for v in self.manifest["volumes"] if v["kind"] == "manipulated" and v["eligible"])
+        common = dict(flip=False, grid=12, crop_mm=16., forced=0, random_centers=0, rng=_rng(1), jitter_fraction=0.)
+        blind = VolumeCase(self.store, volume, body_threshold=2., **common)  # no cell passes the image test
+        self.assertFalse(blind.cell_valid.any())
+        self.assertTrue(blind.cell_target.any())
+        np.testing.assert_array_equal(blind.router_cells, blind.cell_target > 0)  # positives still supervised
+        normal = VolumeCase(self.store, volume, **common)
+        self.assertTrue(np.all(normal.router_cells[normal.cell_valid]))
+        authentic = {"kind": "authentic", "series_key": volume["series_key"], "volume_id": "real:" + volume["series_key"],
+                     "operation": ""}
+        reference = VolumeCase(self.store, authentic, body_threshold=2., **common)
+        np.testing.assert_array_equal(reference.cell_valid, blind.cell_valid)
+
     def test_real_series_follow_descending_z_and_receipts(self):
         key = store_mod.series_key("LIDC-IDRI-0001", "3000001")
         info = self.manifest["series"][key]
@@ -368,7 +383,7 @@ class Training(unittest.TestCase):
         _, train, _, model = self._setup(config)
         model.train()
         indices = trainer.epoch_batches(train, config, 0)[0]
-        weights = trainer.class_weights(train)
+        weights = trainer.class_weights(config)
         state = {k: v.clone() for k, v in model.state_dict().items()}
         torch.manual_seed(5)
         terms, metas = {k: [] for k in trainer.TERMS}, []
@@ -395,6 +410,28 @@ class Training(unittest.TestCase):
                 self.assertTrue(p.grad is None or float(p.grad.abs().max()) == 0., name)
             else:
                 torch.testing.assert_close(p.grad, g, rtol=1e-4, atol=1e-6, msg=name)
+
+    def test_class_weights_balance_each_logical_batch(self):
+        config = small_config(authentic_per_batch=4, manipulated_per_batch=12)
+        weights = trainer.class_weights(config)
+        self.assertAlmostEqual(4 * weights["authentic"], 12 * weights["manipulated"])
+        metas = [{"tampered": i >= 4, "has_removal": i >= 4, "has_visible": False,
+                  "group": "authentic" if i < 4 else "FM", "generator": "" if i < 4 else "cycle"} for i in range(16)]
+        probes = {k: torch.zeros(16) for k in trainer.TERMS}
+        probes["volume"] = torch.tensor([1.] * 4 + [0.] * 12)
+        _, details = trainer.objective(probes, metas, config, weights, risk_active=False)
+        self.assertAlmostEqual(details["volume"], .5, places=6)  # authentic carries half, not 78%
+
+    def test_selection_balances_authentic_removal_and_insertion(self):
+        authentic = [{"kind": "authentic", "generator": "", "operation": "", "volume_loss": 1.,
+                      "tamper_probability": p, "max_crop_probability": p} for p in (.2, .3)]
+        manipulated = [{"kind": "manipulated", "generator": "cycle", "operation": op, "volume_loss": loss,
+                        "tamper_probability": p, "max_crop_probability": p, "removal_probability": .5, "router_hit": False}
+                       for op, loss, p in [("removal", 4., .1)] + [("insertion", 0., .9)] * 4]
+        metrics = trainer.volume_metrics(authentic + manipulated, [.5])
+        self.assertAlmostEqual(metrics["balanced_volume_bce"], (1. + .8) / 2)
+        self.assertAlmostEqual(metrics["group_balanced_volume_bce"], (1. + 4. + 0.) / 3)
+        self.assertEqual(metrics["group_volume_bce"], {"authentic": 1., "insertion": 0., "removal": 4.})
 
     def test_fit_resume_matches_uninterrupted_and_reports(self):
         config = small_config()
@@ -453,11 +490,26 @@ class DiagnosticsAndNotebook(unittest.TestCase):
         self.assertIn("validation_auroc", shortcut["global_histogram_classifier"])
         result = resolution_check(store, GENS, out, pairs_train=0, pairs_validation=0, epochs=1, crop_shape=(8, 16, 16))
         self.assertEqual(result["pairs"], {"train": 8, "validation": 4})
+        self.assertEqual(set(result["by_operation"]), {"removal", "insertion"})
         self.assertTrue((out / "resolution_check.json").exists())
         image = torch.zeros(1, 8, 16, 16)
         image[0, 4, 8, 8] = 1.
         degraded = degrade(image[None], [[4., 4., 4.]])
         self.assertLess(float(degraded.max()), .2)  # a one-voxel trace does not survive coarse voxels
+
+    def test_resolution_pairs_match_appearance_not_location(self):
+        from rsvt.experiments.m3d_diagnostics import MATCHED_SITE, _pairs
+        store = M3DStore(self.fx.store, Path(self.tmp.name) / "cache_pairs")
+        sites = {s["img_id"]: s for s in store.manifest["sites"]}
+        _, labels, _, _, records = _pairs(store, "validation", GENS, 0, 13, (8, 16, 16))
+        paired = [r for r in records if r["paired"]]
+        self.assertEqual(len(paired), 4)
+        for record in paired:
+            site = sites[record["authentic_site"]]
+            self.assertEqual(site["site_label"], MATCHED_SITE[record["operation"]])  # removal vs TB, insertion vs TM
+            self.assertNotEqual(record["volume_id"].split(":")[1], record["authentic_site"])  # never its own location
+            self.assertTrue(record["same_series"])
+        self.assertEqual(labels.tolist(), [1., 0.] * 4)
 
     def test_notebook_session_end_to_end_in_fixture_mode(self):
         from rsvt.training.m3d_notebook import M3DNotebookSession
