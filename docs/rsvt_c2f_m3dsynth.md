@@ -142,7 +142,9 @@ otherwise it reads the store back against its checksums. Section 9 runs the data
 checks once per store (saved beside it) and holds training back if most samples
 failed archive verification or whole-scan statistics separate the classes.
 Section 12 trains only on a GPU; on a CPU runtime it stops with a message, so the
-cheap first run prepares and checks the data and a later GPU run trains.
+cheap first run prepares and checks the data and a later GPU run trains. Section 17
+releases the Colab runtime (`google.colab.runtime.unassign`) after section 16 has
+read every saved file back; if an earlier cell fails, the runtime is kept.
 
 ## Limits
 

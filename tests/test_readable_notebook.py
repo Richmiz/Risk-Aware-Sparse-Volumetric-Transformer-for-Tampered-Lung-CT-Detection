@@ -121,6 +121,18 @@ class NotebookSourceTests(unittest.TestCase):
                 sys.path[:]=before
 
 
+    def test_runtime_is_released_only_after_the_save_check(self):
+        doc=json.loads((ROOT/'notebooks/01_RSVT_TRAINING.ipynb').read_text(encoding='utf-8'))
+        code=[(c['id'],''.join(c['source'])) for c in doc['cells'] if c['cell_type']=='code']
+        self.assertEqual([name for name,_ in code[-2:]],['saved','shutdown'])  # release follows the Drive readback
+        self.assertIn('SHUTDOWN_WHEN_DONE = True',dict(code)['settings'])
+        release=dict(code)['shutdown']
+        self.assertIn('if SHUTDOWN_WHEN_DONE:',release); self.assertIn('runtime.unassign()',release)
+        printed=[]
+        with patch('builtins.print',lambda *a,**k:printed.append(' '.join(map(str,a)))):
+            exec(compile(release,'shutdown','exec'),{'SHUTDOWN_WHEN_DONE':True})  # outside Colab: no release, no error
+        self.assertEqual(printed,['Not running in Colab; nothing to release.'])
+
     def test_training_notebook_clones_the_public_repository_without_credentials(self):
         doc=json.loads((ROOT/'notebooks/01_RSVT_TRAINING.ipynb').read_text(encoding='utf-8'))
         code={c['id']:''.join(c['source']) for c in doc['cells'] if c['cell_type']=='code'}

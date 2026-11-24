@@ -61,6 +61,8 @@ The study trains and validates on M3Dsynth, which edits LIDC-IDRI scans with thr
 2. On a GPU runtime (an L4 is the best value) it reads the saved dataset back against its checksums, reuses the checks, and trains.
 3. After a disconnect, Run all again continues the unfinished training run with the code commit it started with.
 
+When a run finishes and every saved file has been read back from Drive, the last cell releases the Colab runtime so it stops using compute units (`SHUTDOWN_WHEN_DONE`).
+
 The notebook clones this repository at `CODE_REF` (default `main`) and saves the exact commit with each run. The M3Dsynth metadata tables are fetched from the authors' repository at a pinned commit and checked against recorded checksums.
 
 Test patients from the publisher's partition are not downloaded or opened by data preparation, diagnostics, training, or model selection.

@@ -94,6 +94,8 @@ def training_notebook():
         '2. **Then on a GPU runtime** (Runtime → Change runtime type → L4): it reads the saved dataset back, reuses the '
         'checks and trains.\n'
         '3. **After a disconnect**, Run all again: it continues the unfinished training run with the code it started with.\n\n'
+        'When a run finishes and every saved file has been read back from Drive, the last cell releases the runtime so it '
+        'stops using compute units; the outputs stay visible.\n\n'
         'The project code is cloned from GitHub, and the exact commit is saved with each run. '
         'Every output saves automatically to project Drive and is read back against a checksum.\n\n'
         'With the default patient caps the download is about 300 LIDC-IDRI series from the public TCIA API (~33 GB) plus '
@@ -118,7 +120,8 @@ def training_notebook():
          'PATIENTS_TRAIN = 200       # of 488 publisher training patients\n'
          'PATIENTS_VALIDATION = 100  # all publisher validation patients\n'
          'EPOCHS = 30\nLEARNING_RATE = 0.0002\nEARLY_STOPPING_PATIENCE = 8\nSEED = 13\n'
-         'LIDC_ROOT = ""             # optional existing LIDC-IDRI folder in Drive\n'),
+         'LIDC_ROOT = ""             # optional existing LIDC-IDRI folder in Drive\n'
+         'SHUTDOWN_WHEN_DONE = True  # release the runtime after the final save check, so it stops using compute units\n'),
         ('drive','2. Connect Google Drive',
          'Why: the dataset store and the results live here. Use the Google account containing Research/LUNG-CT-SCAN.',
          'from google.colab import drive\ndrive.mount("/content/drive", force_remount=False)\n'),
@@ -191,7 +194,21 @@ def training_notebook():
          'session.show_test_status()\n'),
         ('saved','16. Verify that the results are saved',
          'Why: confirm Drive storage by reading files back against checksums. Expected output: **Saved and verified** and the session path.',
-         'persistence_receipt = session.verify_saved()\nprint("Run folder:", session.root)\n')]
+         'persistence_receipt = session.verify_saved()\nprint("Run folder:", session.root)\n'),
+        ('shutdown','17. Release the runtime',
+         'Why: an idle runtime keeps using compute units until Colab disconnects it. This runs only after section 16 has '
+         'read every saved file back, so nothing is lost; the outputs above stay visible. If an earlier cell failed, Run all '
+         'stopped there and the runtime is kept so you can see the error. Set `SHUTDOWN_WHEN_DONE = False` to keep it.',
+         'if SHUTDOWN_WHEN_DONE:\n'
+         '    try:\n'
+         '        from google.colab import runtime\n'
+         '    except ImportError:\n'
+         '        print("Not running in Colab; nothing to release.")\n'
+         '    else:\n'
+         '        print("Everything is saved and verified in Drive. Releasing the runtime now.")\n'
+         '        runtime.unassign()\n'
+         'else:\n'
+         '    print("Runtime kept (SHUTDOWN_WHEN_DONE = False). Disconnect it when done to stop using compute units.")\n')]
     for name,title,description,code in sections:
         cells.extend([cell('markdown','## '+title+'\n\n'+description+'\n',name+'-description'),cell('code',code,name)])
     return {'nbformat':4,'nbformat_minor':5,'metadata':{
