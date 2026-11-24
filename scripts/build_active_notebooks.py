@@ -27,10 +27,25 @@ FROZEN_REVIEW_SHA = '4c04973de96823a01585ce5741b8cf2ce70689ec5328567593a5204678b
 # Clones the public repository into the runtime. No sign-in is needed; git never
 # prompts, so a failed clone stops with its error instead of waiting for input.
 CODE_CELL = (
-    'import importlib.util, os, subprocess, sys\n'
+    'import importlib.util, json, os, subprocess, sys\n'
     'from pathlib import Path\n'
     'CODE_ROOT = Path("/content/rsvt-code")\n'
     'env = dict(os.environ, GIT_TERMINAL_PROMPT="0")\n'
+    '\n'
+    '# A resumed run keeps the code commit it started with.\n'
+    'RESUME_FOLDER, ref = "", CODE_REF\n'
+    'if RESUME_SESSION == "auto":\n'
+    '    for record in sorted(Path(PROJECT, "outputs/rsvt_training").glob("c2f_*/notebook_session.json"), reverse=True):\n'
+    '        run = record.parent\n'
+    '        if (run / "training/last.pt").exists() and not (run / "training/summary.json").exists():\n'
+    '            RESUME_FOLDER = str(run)\n'
+    '            break\n'
+    'elif RESUME_SESSION:\n'
+    '    RESUME_FOLDER = RESUME_SESSION\n'
+    'if RESUME_FOLDER:\n'
+    '    record = json.loads(Path(RESUME_FOLDER, "notebook_session.json").read_text(encoding="utf-8"))\n'
+    '    ref = record.get("code_commit") or CODE_REF\n'
+    '    print("Continuing the unfinished run", RESUME_FOLDER)\n'
     '\n'
     'def git(*args):\n'
     '    done = subprocess.run(["git", *args], env=env, capture_output=True, text=True)\n'
@@ -42,14 +57,14 @@ CODE_CELL = (
     '    git("clone", "--quiet", REPOSITORY, str(CODE_ROOT))\n'
     'git("-C", str(CODE_ROOT), "fetch", "--quiet", "--tags", "origin")\n'
     'commit = None\n'
-    'for candidate in (f"origin/{CODE_REF}", CODE_REF):\n'
+    'for candidate in (f"origin/{ref}", ref):\n'
     '    try:\n'
     '        commit = git("-C", str(CODE_ROOT), "rev-parse", "--verify", "--quiet", candidate + "^{commit}")\n'
     '        break\n'
     '    except RuntimeError:\n'
     '        pass\n'
     'if commit is None:\n'
-    '    raise RuntimeError(f"CODE_REF {CODE_REF!r} is not a branch, tag or commit of the repository")\n'
+    '    raise RuntimeError(f"{ref!r} is not a branch, tag or commit of the repository")\n'
     'if "rsvt" in sys.modules and globals().get("RSVT_COMMIT") not in (None, commit):\n'
     '    raise RuntimeError("This session already loaded other code. Runtime > Restart session, then Run all.")\n'
     'git("-C", str(CODE_ROOT), "checkout", "--quiet", "--detach", commit)\n'
@@ -73,63 +88,70 @@ def training_notebook():
         '# RSVT — M3Dsynth Training and Results (coarse-to-fine)\n\n'
         'This notebook prepares the **M3Dsynth** dataset (manipulated LIDC-IDRI lung CT: nodule removal and insertion by '
         'CycleGAN, pix2pix and diffusion generators), checks it, trains the coarse-to-fine RSVT and shows its results.\n\n'
-        '**Open this notebook in Google Colab from GitHub and choose a GPU runtime** (Runtime → Change runtime type). '
-        'The project code is cloned from GitHub at `CODE_REF`, and the exact commit is saved with each session. '
+        '**Just Run all; the defaults are ready.** Each run decides what to do from what is already saved in Drive:\n\n'
+        '1. **First, on a CPU runtime** (cheapest): it downloads and verifies the dataset, runs the data checks and stops '
+        'before training. This takes hours; keep the tab open.\n'
+        '2. **Then on a GPU runtime** (Runtime → Change runtime type → L4): it reads the saved dataset back, reuses the '
+        'checks and trains.\n'
+        '3. **After a disconnect**, Run all again: it continues the unfinished training run with the code it started with.\n\n'
+        'The project code is cloned from GitHub, and the exact commit is saved with each run. '
         'Every output saves automatically to project Drive and is read back against a checksum.\n\n'
-        '**Data preparation downloads data only when you set `PREPARE_DATA = True`.** With the default patient caps it fetches '
-        'about 260 LIDC-IDRI series from the public TCIA API (~30 GB) and streams the three author archives '
-        '(cycle 171 GB, pix2pix 142 GB, diffusion 161 GB) from grip.unina.it. Only verified boxes around each edit are kept, '
-        'so Drive storage stays near 15–20 GB. Streaming takes hours. A dropped connection reconnects at the same byte; '
-        'if the runtime restarts, finished archives and samples are kept and only the current archive is read again.\n\n'
+        'With the default patient caps the download is about 300 LIDC-IDRI series from the public TCIA API (~33 GB) plus '
+        'one pass over the three author archives (cycle 171 GB, pix2pix 142 GB, diffusion 161 GB) from grip.unina.it. '
+        'Only verified boxes around each edit are kept, so Drive storage stays near 22 GB. '
+        'A dropped connection reconnects at the same byte; if the runtime restarts, finished archives and samples are kept '
+        'and only the current archive is read again.\n\n'
         'Licences: M3Dsynth (GRIP-UNINA, non-profit research use with attribution) and LIDC-IDRI (TCIA, CC BY 3.0). '
         'Test patients are not downloaded or opened here.\n', 'introduction')]
     sections=[
         ('settings','1. Choose the run settings',
-         'Why: keep the settings you may change in one place. `CODE_REF` chooses the code: a branch, a tag or a commit. '
-         'To resume a session, paste its Drive folder into `RESUME_SESSION` and keep the same settings and code. '
-         '`LIDC_ROOT` may point to an existing LIDC-IDRI download in Drive (NBIA folder layout); '
-         'leave it empty to fetch series from TCIA.',
+         'Why: everything you might change is here, and the defaults are ready to run. There are no stage switches: the '
+         'notebook prepares data, checks it and trains according to what is saved and whether a GPU is present. '
+         '`RESUME_SESSION = "auto"` continues the latest unfinished training run; changing any setting below needs a new '
+         'run, so then set `RESUME_SESSION = ""`. `CODE_REF` chooses the code for a new run (a branch, tag or commit). '
+         '`LIDC_ROOT` may point to an existing LIDC-IDRI download in Drive (NBIA folder layout).',
          'PROJECT = "/content/drive/MyDrive/Research/LUNG-CT-SCAN"\n'
          f'REPOSITORY = "{REPOSITORY}"\n'
-         'CODE_REF = "main"         # branch, tag or commit; the exact commit is saved with the session\n'
-         'PREPARE_DATA = False      # True = download/stream and verify M3Dsynth (resumable)\n'
-         'RUN_DIAGNOSTICS = True    # resolution and shortcut checks before training\n'
-         'RUN_TRAINING = True\n'
+         'CODE_REF = "main"          # code for a new run; a resumed run keeps the commit it started with\n'
+         'RESUME_SESSION = "auto"    # "auto" = continue the latest unfinished run; "" = new run; or a run folder\n'
          'GENERATORS = ["cycle", "pix2pix", "diffusion"]  # remove one to hold it out\n'
-         'PATIENTS_TRAIN = 200      # of 488 publisher training patients\n'
-         'PATIENTS_VALIDATION = 60  # of 100 publisher validation patients\n'
+         'PATIENTS_TRAIN = 200       # of 488 publisher training patients\n'
+         'PATIENTS_VALIDATION = 100  # all publisher validation patients\n'
          'EPOCHS = 30\nLEARNING_RATE = 0.0002\nEARLY_STOPPING_PATIENCE = 8\nSEED = 13\n'
-         'LIDC_ROOT = ""            # optional existing LIDC-IDRI folder in Drive\n'
-         'RESUME_SESSION = ""       # empty = a new session\n'),
+         'LIDC_ROOT = ""             # optional existing LIDC-IDRI folder in Drive\n'),
         ('drive','2. Connect Google Drive',
          'Why: the dataset store and the results live here. Use the Google account containing Research/LUNG-CT-SCAN.',
          'from google.colab import drive\ndrive.mount("/content/drive", force_remount=False)\n'),
         ('code','3. Get the project code from GitHub',
-         'Why: the implementation lives in the repository, not in long cells. This clones it into the runtime, checks out '
-         '`CODE_REF` and installs the two missing packages. The repository is public, so no sign-in is needed. '
-         'Expected output: the exact commit being run.',
+         'Why: the implementation lives in the repository, not in long cells. This finds the run to continue (if any), clones '
+         'the repository into the runtime, checks out its code and installs the two missing packages. The repository is '
+         'public, so no sign-in is needed. Expected output: the exact commit being run.',
          CODE_CELL),
-        ('session','4. Create a saved session',
-         'Why: each run gets its own Drive folder with its settings and code commit. The M3Dsynth metadata tables are '
-         'downloaded from the authors\' GitHub at a pinned commit and checked against their recorded checksums. '
-         'Expected output: the session folder in Drive.',
+        ('session','4. Open the run folder',
+         'Why: each run has its own Drive folder with its settings and code commit; an unfinished run is reopened. The '
+         'M3Dsynth metadata tables are downloaded from the authors\' GitHub at a pinned commit and checked against their '
+         'recorded checksums. Expected output: the run folder in Drive.',
          'from rsvt.training.m3d_notebook import create_session\n'
          'session = create_session(PROJECT, CODE_ROOT, epochs=EPOCHS, learning_rate=LEARNING_RATE,\n'
          '    patience=EARLY_STOPPING_PATIENCE, seed=SEED, patients_train=PATIENTS_TRAIN,\n'
          '    patients_validation=PATIENTS_VALIDATION, generators=tuple(GENERATORS),\n'
-         '    lidc_root=LIDC_ROOT or None, resume_session=RESUME_SESSION, code_commit=RSVT_COMMIT)\n'
-         'print("Session saved in Drive:", session.root)\n'),
+         '    lidc_root=LIDC_ROOT or None, resume_session=RESUME_FOLDER, code_commit=RSVT_COMMIT)\n'
+         'print("Run folder in Drive:", session.root)\n'),
         ('hardware','5. Check the actual runtime and GPU',
-         'Why: a server label is not proof of a GPU. This checks what PyTorch sees. Data preparation runs on CPU; training needs CUDA.',
+         'Why: a server label is not proof of a GPU. This checks what PyTorch sees. Data preparation and the data checks '
+         'run on CPU; training needs a GPU.',
          'runtime_information = session.show_runtime()\n'),
-        ('plan','6. Review the data plan before downloading',
-         'Why: see patients, series, archive sizes and expected Drive storage before any transfer. Nothing is downloaded here.',
+        ('plan','6. Review the data plan',
+         'Why: see patients, series, archive sizes, Drive storage, the state of the saved dataset and free space before any '
+         'transfer. Nothing is downloaded here.',
          'data_plan = session.plan_data()\n'),
         ('prepare','7. Prepare and verify M3Dsynth',
-         'Why: build the dataset store. Each manipulated slice is compared with the real LIDC slice while it streams; a sample is '
-         'kept only if every change lies inside its stored box and the author mask is complete. With `PREPARE_DATA=False` this '
-         'cell only verifies an existing store. Expected output: progress, then a checksum-verified manifest.',
-         'manifest = session.prepare_data(download=PREPARE_DATA)\n'),
+         'Why: build the dataset store, or confirm the saved one. It downloads only what the saved dataset is missing (on '
+         'the first run, everything) and otherwise reads the saved store back against its checksums. It checks free space '
+         'first and stops before downloading if Google Drive or the runtime disk is too small. Each manipulated slice is '
+         'compared with the real LIDC slice while it streams; a sample is kept only if every change lies inside its stored '
+         'box and the author mask is complete. Expected output: progress, then a checksum-verified manifest.',
+         'manifest = session.prepare_data()\n'),
         ('dataset','8. Inspect the dataset with real CT slices',
          'Why: confirm what the model will see. Expected output: counts per partition/generator/operation and training examples '
          'showing the authentic slice, the manipulated slice, their difference and the author mask. No test data is opened.',
@@ -139,8 +161,10 @@ def training_notebook():
          'from authentic sites that look alike (removals vs healthy-tissue TB sites, insertions vs real-nodule TM sites) at '
          'native resolution and degraded to the 96³ voxel size; results are shown per operation. This tests the evidence at '
          'a known site, not whether the router can find it. (b) Archive identity outside the edit, mask coverage, and whether '
-         'whole-scan statistics alone separate classes. Uses train/validation only.',
-         'if RUN_DIAGNOSTICS and session.has_store():\n    diagnostics = session.run_diagnostics()\n'),
+         'whole-scan statistics alone separate classes. Uses train/validation only. The checks run once per dataset and are '
+         'reused afterwards. Training is held back if most samples failed archive verification or if whole-scan statistics '
+         'alone separate the classes.',
+         'diagnostics = session.run_diagnostics() if session.has_store() else None\n'),
         ('configuration','10. Understand the training configuration',
          'Why: see batches, crops, loss and risk weights, early stopping and checkpoint selection before training.',
          'configuration_table = session.show_configuration()\n'),
@@ -149,12 +173,12 @@ def training_notebook():
          'evidence is read only there. The table compares this with running the same encoder over the whole native volume.',
          'if session.has_store():\n    parameter_count = session.show_model()\n'),
         ('training','12. Train and watch the epoch results',
-         'Why: learn from training volumes and monitor validation volumes. Expected output: batch progress, an updating epoch '
+         'Why: learn from training volumes and monitor validation volumes. On a GPU runtime this trains, or continues the '
+         'unfinished run; on a CPU runtime it stops here with a message. Expected output: batch progress, an updating epoch '
          'table and learning curves. The first epochs train without tail risk; the checkpoint is chosen among risk-stage epochs '
          'by the validation loss averaged over authentic, removal and insertion volumes. Checkpoints and logs save to Drive '
-         'after every epoch; re-running resumes.',
-         'if RUN_TRAINING and session.has_store():\n    training_summary = session.train()\nelse:\n'
-         '    print("Training not run in this execution. No training result is claimed.")\n'),
+         'after every epoch.',
+         'training_summary = session.train_when_ready(diagnostics) if session.has_store() else None\n'),
         ('curves','13. Review the learning curves',
          'Why: compare training objective with validation loss and AUROCs. Falling training loss alone does not prove generalization.',
          'epoch_history = session.show_history()\n'),
@@ -167,7 +191,7 @@ def training_notebook():
          'session.show_test_status()\n'),
         ('saved','16. Verify that the results are saved',
          'Why: confirm Drive storage by reading files back against checksums. Expected output: **Saved and verified** and the session path.',
-         'persistence_receipt = session.verify_saved()\nprint("To resume this session:", session.root)\n')]
+         'persistence_receipt = session.verify_saved()\nprint("Run folder:", session.root)\n')]
     for name,title,description,code in sections:
         cells.extend([cell('markdown','## '+title+'\n\n'+description+'\n',name+'-description'),cell('code',code,name)])
     return {'nbformat':4,'nbformat_minor':5,'metadata':{

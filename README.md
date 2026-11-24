@@ -55,8 +55,12 @@ The study trains and validates on M3Dsynth, which edits LIDC-IDRI scans with thr
 
 ## Running the study
 
-[Open `notebooks/01_RSVT_TRAINING.ipynb` in Colab](https://colab.research.google.com/github/Richmiz/Risk-Aware-Sparse-Volumetric-Transformer-for-Tampered-Lung-CT-Detection/blob/main/notebooks/01_RSVT_TRAINING.ipynb) and choose a GPU runtime. The notebook clones this repository at `CODE_REF` (default `main`) and saves the exact commit with each session.
+[Open `notebooks/01_RSVT_TRAINING.ipynb` in Colab](https://colab.research.google.com/github/Richmiz/Risk-Aware-Sparse-Volumetric-Transformer-for-Tampered-Lung-CT-Detection/blob/main/notebooks/01_RSVT_TRAINING.ipynb) and use Run all; the defaults are ready. The notebook decides each stage from what is already saved in Google Drive:
 
-The notebook mounts Google Drive for the dataset store and the results. It shows the data plan, downloads and verifies the selected M3Dsynth samples and their LIDC-IDRI source series when `PREPARE_DATA = True`, runs resolution and shortcut checks, and trains the model. The M3Dsynth metadata tables are fetched from the authors' repository at a pinned commit and checked against recorded checksums. Data preparation and training resume after an interruption.
+1. On a CPU runtime it checks free space, downloads and verifies the selected M3Dsynth samples and their LIDC-IDRI source series, runs the resolution and shortcut checks, and stops before training.
+2. On a GPU runtime (an L4 is the best value) it reads the saved dataset back against its checksums, reuses the checks, and trains.
+3. After a disconnect, Run all again continues the unfinished training run with the code commit it started with.
+
+The notebook clones this repository at `CODE_REF` (default `main`) and saves the exact commit with each run. The M3Dsynth metadata tables are fetched from the authors' repository at a pinned commit and checked against recorded checksums.
 
 Test patients from the publisher's partition are not downloaded or opened by data preparation, diagnostics, training, or model selection.

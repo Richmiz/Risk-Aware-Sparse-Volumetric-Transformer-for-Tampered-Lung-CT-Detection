@@ -90,6 +90,37 @@ class ReadableSessionTests(unittest.TestCase):
 
 
 class NotebookSourceTests(unittest.TestCase):
+    @unittest.skipUnless((ROOT/'.git').exists(),'needs a git checkout to clone from')
+    def test_code_cell_continues_the_latest_unfinished_run_with_its_commit(self):
+        import subprocess, tempfile
+        doc=json.loads((ROOT/'notebooks/01_RSVT_TRAINING.ipynb').read_text(encoding='utf-8'))
+        cell=next(''.join(c['source']) for c in doc['cells'] if c.get('id')=='code')
+        head=subprocess.run(['git','-C',str(ROOT),'rev-parse','HEAD'],capture_output=True,text=True,check=True).stdout.strip()
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            tmp=Path(tmp); runs=tmp/'project/outputs/rsvt_training'
+            def run(name,*,trained,finished,commit='0'*40):
+                folder=runs/name; (folder/'training').mkdir(parents=True)
+                (folder/'notebook_session.json').write_text(json.dumps({'code_commit':commit}),encoding='utf-8')
+                if trained:(folder/'training/last.pt').write_bytes(b'x')
+                if finished:(folder/'training/summary.json').write_text('{}',encoding='utf-8')
+                return folder
+            unfinished=run('c2f_20980101T000000_000000Z',trained=True,finished=False,commit=head)
+            run('c2f_20990101T000000_000000Z',trained=True,finished=True)   # finished: never resumed
+            run('c2f_20990201T000000_000000Z',trained=False,finished=False) # data-only run: nothing to resume
+            source=cell.replace('Path("/content/rsvt-code")',f'Path(r"{tmp/"code"}")')
+            before=list(sys.path)
+            try:
+                for setting,expected in (('auto',str(unfinished)),('','')):
+                    scope={'PROJECT':str(tmp/'project'),'REPOSITORY':str(ROOT),'CODE_REF':'main','RESUME_SESSION':setting}
+                    with patch('sys.stdout'):
+                        exec(compile(source,'code-cell','exec'),scope)
+                    self.assertEqual(scope['RESUME_FOLDER'],expected)
+                    self.assertEqual(len(scope['RSVT_COMMIT']),40)
+                    if setting=='auto':self.assertEqual(scope['RSVT_COMMIT'],head)
+            finally:
+                sys.path[:]=before
+
+
     def test_training_notebook_clones_the_public_repository_without_credentials(self):
         doc=json.loads((ROOT/'notebooks/01_RSVT_TRAINING.ipynb').read_text(encoding='utf-8'))
         code={c['id']:''.join(c['source']) for c in doc['cells'] if c['cell_type']=='code'}

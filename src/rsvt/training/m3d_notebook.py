@@ -14,6 +14,7 @@ from io import BytesIO
 import json
 from pathlib import Path
 import platform
+import shutil
 import sys
 
 import numpy as np
@@ -34,7 +35,7 @@ UID_MAP_RELATIVE = "reports/supplementary/data_label_audit_20261111/metadata_rev
 
 class M3DNotebookSession:
     def __init__(self, project, code_root, *, epochs=30, learning_rate=2e-4, patience=8, seed=13,
-                 patients_train=200, patients_validation=60, generators=("cycle", "pix2pix", "diffusion"),
+                 patients_train=200, patients_validation=100, generators=("cycle", "pix2pix", "diffusion"),
                  resume_session="", configuration=None, store_root=None, cache_root=None, work_root=None,
                  lidc_root=None, metadata_dir=None, enforce_drive=True, display_enabled=True, code_commit=None):
         self.project, self.code_root = Path(project).resolve(), Path(code_root).resolve()
@@ -66,7 +67,8 @@ class M3DNotebookSession:
         if resume_session:
             stored = json.loads((self.root / "notebook_session.json").read_text(encoding="utf-8"))
             if stored["binding"] != binding:
-                raise ValueError("Resume needs the same settings and code (CODE_REF) as the original session")
+                raise ValueError("Resuming needs the same settings and code as the run being resumed. Restore the "
+                                 "settings, or set RESUME_SESSION = \"\" to start a new run.")
         else:
             self.root.mkdir(parents=True, exist_ok=False)
         self.training_dir, self.assets = self.root / "training", self.root / "figures"
@@ -147,22 +149,77 @@ class M3DNotebookSession:
                 ("Archive stream per generator", ", ".join(f"{g}: {s} GB" for g, s in estimate["archive_stream_gb"].items())),
                 ("Estimated Drive storage", f"{estimate['estimated_drive_gb']} GB in {STORE_RELATIVE}"),
                 ("Note", estimate["note"])]
+        status = self.store_status()
+        rows.append(("Dataset store now", "complete for this selection" if status["complete"] else status["reason"]))
+        if not status["complete"]:
+            space = self.check_storage(stop=False)
+            rows += [(f"Free space: {name}", f"{info['free_gb']} GB free, about {info['needed_gb']} GB needed")
+                     for name, info in space["locations"].items()]
         self._html("<h3>M3Dsynth data plan</h3>" + table_html(["Item", "Value"], rows))
-        self._save_json("data_plan.json", {"selection_counts": counts, "estimate": estimate,
+        self._save_json("data_plan.json", {"selection_counts": counts, "estimate": estimate, "store_status": status,
                                            "metadata_sha256": self.meta["sha256"]})
         return estimate
 
-    def prepare_data(self, *, download=False, generators=None, tcia_base=store_mod.TCIA_BASE,
+    def store_status(self):
+        """Does the verified store cover the current selection? Reads the manifest only (no images)."""
+        path = self.store_root / "manifest.json"
+        if not path.exists():
+            return {"exists": False, "complete": False, "reason": "no dataset store yet", "missing_series": []}
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        stored = manifest.get("selection", {})
+        same = all(stored.get(key) == self.selection[key] for key in ("counts", "generators", "seed"))
+        # Samples absent from an author archive stay excluded for good; only missing LIDC series are worth fetching again.
+        missing = sorted(e["series_key"] for e in manifest.get("excluded", []) if "volume_id" not in e)
+        reason = ("complete" if same and not missing else
+                  "the selection changed (patients, generators or seed)" if not same else
+                  f"{len(missing)} LIDC series not acquired yet")
+        return {"exists": True, "complete": same and not missing, "reason": reason, "missing_series": missing}
+
+    def check_storage(self, *, stop=True, margin_gb=2.):
+        """Compare free Drive and runtime-disk space with what the download still needs."""
+        estimate = store_mod.storage_estimate(self.selection)
+        used = (sum(p.stat().st_size for p in self.store_root.rglob("*") if p.is_file()) / 1e9
+                if self.store_root.exists() else 0.)
+        needs = {"Google Drive": (self.project, max(0., estimate["estimated_drive_gb"] - used) + margin_gb),
+                 # uncompressed series (~80 MB each) stay on the runtime disk while the archives stream
+                 "runtime disk": (self.cache_root, estimate["real_series"] * .08 + margin_gb)}
+        locations, problems = {}, []
+        for name, (path, needed) in needs.items():
+            probe = Path(path)
+            while not probe.exists() and probe != probe.parent:
+                probe = probe.parent
+            usage = shutil.disk_usage(probe)
+            locations[name] = {"free_gb": round(usage.free / 1e9, 1), "total_gb": round(usage.total / 1e9, 1),
+                               "needed_gb": round(needed, 1)}
+            if usage.total and usage.free < needed * 1e9:  # a size of 0 means the mount does not report space
+                problems.append(f"{name}: {usage.free / 1e9:.1f} GB free, about {needed:.1f} GB needed")
+        report = {"locations": locations, "problems": problems}
+        self._save_json("storage_check.json", report)
+        if stop and problems:
+            raise RuntimeError("Not enough space, so nothing was downloaded. " + "; ".join(problems)
+                               + ". Free space in Google Drive or lower PATIENTS_TRAIN / PATIENTS_VALIDATION.")
+        return report
+
+    def prepare_data(self, *, download="auto", generators=None, tcia_base=store_mod.TCIA_BASE,
                      archive_sources=None, extracted_root=None):
-        """Acquire (resumably) and verify the store. Without `download`, only reports what exists."""
+        """Acquire (resumably) and verify the store.
+
+        `download="auto"` downloads only when the store does not yet cover the selection;
+        otherwise the saved store is read back against its checksums.
+        """
         manifest_path = self.store_root / "manifest.json"
+        if download == "auto":
+            status = self.store_status()
+            download = not status["complete"]
+            self._html(f"<p><b>Dataset store:</b> {escape(status['reason'])}"
+                       f"{' — downloading what is missing.' if download else ' — verifying the saved files.'}</p>")
         if not download:
             if manifest_path.exists():
-                self._html("<p><b>Existing verified store found.</b> Set PREPARE_DATA=True only to add missing parts.</p>")
+                self._html("<p><b>Existing verified store found.</b> Reading it back against its checksums.</p>")
                 return self.verify_dataset()
-            self._html("<p><b>No M3Dsynth store yet.</b> Review the data plan above, then set PREPARE_DATA=True and run this cell. "
-                       "Nothing was downloaded.</p>")
+            self._html("<p><b>No M3Dsynth store yet.</b> Nothing was downloaded.</p>")
             return None
+        self.check_storage()
         if self.display_enabled:
             from IPython.display import HTML, display
             self._handles["status"] = display(HTML("<p>Preparing M3Dsynth…</p>"), display_id=True)
@@ -201,7 +258,7 @@ class M3DNotebookSession:
     def has_store(self):
         present = (self.store_root / "manifest.json").exists()
         if not present:
-            self._html("<p><b>No prepared M3Dsynth store yet.</b> Set PREPARE_DATA=True in section 1 and run the data cell. "
+            self._html("<p><b>No prepared M3Dsynth store yet.</b> Section 7 prepares it. "
                        "Nothing is trained or shown on missing data.</p>")
         return present
 
@@ -266,15 +323,30 @@ class M3DNotebookSession:
 
     # ------------------------------------------------------------------ diagnostics
     def run_diagnostics(self, *, pairs_train=600, pairs_validation=200, epochs=6):
-        from rsvt.experiments.m3d_diagnostics import resolution_check, shortcut_check
-        store = self._store()
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        folder = self.root / "diagnostics"
-        report = self._progress_printer("[diagnostics]")
-        shortcut = shortcut_check(store, self.config["data"]["generators"], folder)
-        resolution = resolution_check(store, self.config["data"]["generators"], folder, device=device,
-                                      pairs_train=pairs_train, pairs_validation=pairs_validation, epochs=epochs,
-                                      seed=self.config["training"]["seed"], progress=report)
+        """Run the data checks once per dataset store and reuse them; return blocking problems with the results.
+
+        Results live beside the store, keyed by its manifest, the generators, the seed and the
+        diagnostics code, so a CPU data session and a later GPU training session share them.
+        """
+        from rsvt.experiments import m3d_diagnostics
+        names = ("shortcut_check.json", "resolution_check.json")
+        key = store_mod.digest_json({"manifest": sha256_path(self.store_root / "manifest.json"),
+                                     "generators": self.config["data"]["generators"], "seed": self.config["training"]["seed"],
+                                     "settings": [pairs_train, pairs_validation, epochs],
+                                     "code": sha256_path(Path(m3d_diagnostics.__file__))})[:16]
+        folder = self.store_root / "diagnostics" / key
+        reused = all((folder / name).exists() for name in names)
+        if reused:
+            shortcut, resolution = (json.loads((folder / name).read_text(encoding="utf-8")) for name in names)
+        else:
+            store = self._store()
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            report = self._progress_printer("[diagnostics]")
+            shortcut = m3d_diagnostics.shortcut_check(store, self.config["data"]["generators"], folder)
+            resolution = m3d_diagnostics.resolution_check(
+                store, self.config["data"]["generators"], folder, device=device, pairs_train=pairs_train,
+                pairs_validation=pairs_validation, epochs=epochs, seed=self.config["training"]["seed"], progress=report)
+        problems = self.diagnostics_problems({"shortcut": shortcut})
         number = lambda v: "—" if v is None else f"{v:.3f}"
         identity = shortcut["archive_identity"]
         per_operation = [(f"{op.capitalize()} AUROC, native / degraded to 96³ voxels",
@@ -289,10 +361,26 @@ class M3DNotebookSession:
             ("Changed voxels outside stored boxes (eligible)", identity["eligible_changed_voxels_outside_box"]),
             ("Edits extending beyond the author mask box", number(identity["edits_extending_beyond_author_mask_bbox"])),
             ("Whole-scan histogram classifier AUROC", number(shortcut["global_histogram_classifier"]["validation_auroc"])),
-            ("Shortcut conclusion", shortcut["interpretation"])]))
-        for name in ("resolution_check.json", "shortcut_check.json"):
+            ("Shortcut conclusion", shortcut["interpretation"]),
+            ("Results", "reused from an earlier run on this dataset" if reused else "computed now and saved with the dataset"),
+            ("Blocks training", "; ".join(problems) if problems else "no")]))
+        for name in names:
             self.artifacts["diagnostics/" + name] = {"sha256": sha256_path(folder / name)}
-        return {"resolution": resolution, "shortcut": shortcut}
+        self._save_json("diagnostics.json", {"folder": str(folder), "key": key, "reused": reused, "problems": problems})
+        return {"resolution": resolution, "shortcut": shortcut, "problems": problems, "folder": str(folder)}
+
+    @staticmethod
+    def diagnostics_problems(diagnostics):
+        """Data-check results that make a training run pointless until they are understood."""
+        problems = []
+        identity = diagnostics["shortcut"]["archive_identity"]
+        receipts, eligible = identity["manipulated_receipts"], identity["eligible"]
+        if receipts and eligible / receipts < .5:
+            problems.append(f"only {eligible} of {receipts} manipulated samples passed archive verification")
+        auroc = diagnostics["shortcut"]["global_histogram_classifier"]["validation_auroc"]
+        if auroc is not None and abs(auroc - .5) >= .1:
+            problems.append(f"whole-scan intensity statistics alone separate the classes (AUROC {auroc:.2f})")
+        return problems
 
     # ------------------------------------------------------------------ model and training
     def show_configuration(self):
@@ -382,6 +470,20 @@ class M3DNotebookSession:
         else:
             message = json.dumps(event, default=str)[:200]
         self._handles["status"].update(HTML("<p><b>" + escape(message) + "</b></p>"))
+
+    def train_when_ready(self, diagnostics=None):
+        """Train (or resume) on a GPU unless a data check blocks it; on a CPU runtime explain the next step."""
+        if self.config["training"]["device"] == "cuda" and not torch.cuda.is_available():
+            self._html("<p><b>No GPU in this runtime, so training waits.</b> The dataset and its checks are saved. "
+                       "Switch to a GPU runtime (Runtime → Change runtime type → L4) and Run all; training starts, "
+                       "or resumes, automatically.</p>")
+            return None
+        problems = (diagnostics or {}).get("problems") or []
+        if problems:
+            self._html("<p><b>Training was not started</b> because a data check failed: " + escape("; ".join(problems))
+                       + ". Look at section 9 before training on this dataset.</p>")
+            return None
+        return self.train()
 
     def train(self):
         if self.config["training"]["device"] == "cuda" and not torch.cuda.is_available():

@@ -127,15 +127,22 @@ accuracy, router recall@K and mask Dice on crops containing the site.
 
 ## Running it
 
-Open `notebooks/01_RSVT_TRAINING.ipynb` in Colab from GitHub with a GPU runtime.
-Section 3 clones the public repository at `CODE_REF` and records the exact
-commit. Section 4 fetches the M3Dsynth metadata tables at a pinned commit
-of the authors' repository and checks their SHA-256. Without the audited UID map,
-which stays out of the repository, each LIDC series is found on TCIA by patient
-and series number; on a sample of 30 series this gave the audited UID every time.
-Review the data plan (section 6), set `PREPARE_DATA = True` to download and verify,
-then run the remaining sections. Data preparation and training both resume after
-interruption.
+Open `notebooks/01_RSVT_TRAINING.ipynb` in Colab from GitHub and use Run all;
+there are no stage switches. Section 3 continues the latest unfinished training
+run when there is one (`RESUME_SESSION = "auto"`), checking out the commit that
+run started with; otherwise it clones the public repository at `CODE_REF`. Section
+4 fetches the M3Dsynth metadata tables at a pinned commit of the authors'
+repository and checks their SHA-256. Without the audited UID map, which stays out
+of the repository, each LIDC series is found on TCIA by patient and series number;
+on a sample of 30 series this gave the audited UID every time.
+
+Section 7 downloads only what the saved store is missing for the current
+selection, after checking free space in Google Drive and on the runtime disk;
+otherwise it reads the store back against its checksums. Section 9 runs the data
+checks once per store (saved beside it) and holds training back if most samples
+failed archive verification or whole-scan statistics separate the classes.
+Section 12 trains only on a GPU; on a CPU runtime it stops with a message, so the
+cheap first run prepares and checks the data and a later GPU run trains.
 
 ## Limits
 

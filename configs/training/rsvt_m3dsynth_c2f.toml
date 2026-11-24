@@ -16,7 +16,7 @@ jitter_fraction = 0.25
 # Patient caps keep Drive storage bounded; all sites and generators of a chosen
 # patient are kept together. Test stays unacquired until final evaluation.
 patients_train = 200
-patients_validation = 60
+patients_validation = 100     # all publisher validation patients (more authentic scans for low-FPR thresholds)
 patients_test = 0
 half_box_mm = 48.0        # stored box half-extent around each author manipulation centre
 seed = 13

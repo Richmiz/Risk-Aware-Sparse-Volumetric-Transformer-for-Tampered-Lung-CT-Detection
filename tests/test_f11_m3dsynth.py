@@ -659,6 +659,45 @@ class DiagnosticsAndNotebook(unittest.TestCase):
             self.assertTrue(record["same_series"])
         self.assertEqual(labels.tolist(), [1., 0.] * 4)
 
+    def test_run_all_decides_stages_from_saved_state(self):
+        from rsvt.experiments import m3d_diagnostics
+        from rsvt.training.m3d_notebook import M3DNotebookSession
+        root = Path(self.tmp.name)
+        (root / "auto_project/outputs/rsvt_training").mkdir(parents=True)
+        repo = Path(__file__).resolve().parents[1]
+
+        def session(**changes):
+            settings = dict(configuration=small_config(), epochs=2, learning_rate=1e-3, patience=0, seed=13,
+                            patients_train=2, patients_validation=1, generators=GENS, metadata_dir=self.fx.meta_dir,
+                            lidc_root=self.fx.lidc, enforce_drive=False, display_enabled=False,
+                            store_root=self.fx.store, cache_root=root / "auto_cache")
+            settings.update(changes)
+            return M3DNotebookSession(root / "auto_project", repo, **settings)
+
+        ready = session()
+        self.assertTrue(ready.store_status()["complete"])
+        with mock.patch.object(store_mod, "acquire_real_series", side_effect=AssertionError("downloaded again")), \
+                mock.patch.object(store_mod, "stream_generator", side_effect=AssertionError("streamed again")):
+            self.assertEqual(ready.prepare_data()["schema_version"], "m3dsynth_store_v1")  # verified, not downloaded
+        self.assertEqual(session(generators=("cycle",)).store_status()["reason"],
+                         "the selection changed (patients, generators or seed)")
+        first = ready.run_diagnostics(pairs_train=0, pairs_validation=0, epochs=1)
+        with mock.patch.object(m3d_diagnostics, "resolution_check", side_effect=AssertionError("recomputed")):
+            again = session().run_diagnostics(pairs_train=0, pairs_validation=0, epochs=1)
+        self.assertEqual((again["folder"], again["problems"]), (first["folder"], first["problems"]))
+        self.assertTrue(Path(first["folder"]).is_relative_to(self.fx.store))  # saved with the dataset, shared by runs
+        cuda = small_config()
+        cuda["training"]["device"] = "cuda"
+        with mock.patch.object(torch.cuda, "is_available", return_value=False):
+            self.assertIsNone(session(configuration=cuda).train_when_ready())  # CPU runtime: training waits
+        self.assertIsNone(ready.train_when_ready({"problems": ["whole-scan statistics separate the classes"]}))
+        fresh = session(store_root=root / "auto_store_empty")
+        tiny = type("Usage", (), {"total": 10 ** 12, "used": 10 ** 12, "free": 10 ** 8})()
+        with mock.patch("shutil.disk_usage", return_value=tiny), \
+                mock.patch.object(store_mod, "acquire_real_series", side_effect=AssertionError("downloaded")):
+            with self.assertRaisesRegex(RuntimeError, "Not enough space, so nothing was downloaded"):
+                fresh.prepare_data()
+
     def test_notebook_session_end_to_end_in_fixture_mode(self):
         from rsvt.training.m3d_notebook import M3DNotebookSession
         root = Path(self.tmp.name)
