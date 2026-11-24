@@ -79,7 +79,8 @@ def training_notebook():
         '**Data preparation downloads data only when you set `PREPARE_DATA = True`.** With the default patient caps it fetches '
         'about 260 LIDC-IDRI series from the public TCIA API (~30 GB) and streams the three author archives '
         '(cycle 171 GB, pix2pix 142 GB, diffusion 161 GB) from grip.unina.it. Only verified boxes around each edit are kept, '
-        'so Drive storage stays near 15–20 GB. Streaming takes hours; it resumes where it stopped.\n\n'
+        'so Drive storage stays near 15–20 GB. Streaming takes hours. A dropped connection reconnects at the same byte; '
+        'if the runtime restarts, finished archives and samples are kept and only the current archive is read again.\n\n'
         'Licences: M3Dsynth (GRIP-UNINA, non-profit research use with attribution) and LIDC-IDRI (TCIA, CC BY 3.0). '
         'Test patients are not downloaded or opened here.\n', 'introduction')]
     sections=[

@@ -31,6 +31,8 @@ from collections import Counter, defaultdict
 import csv
 from datetime import datetime, timezone
 import hashlib
+import http.client
+import io
 from io import BytesIO
 import json
 import math
@@ -329,10 +331,17 @@ def convert_series(directory, expected):
     return u16, meta
 
 
-def _fetch(url, timeout=120):
-    request = urllib.request.Request(url, headers={"User-Agent": "rsvt-research-client"})
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return response.read()
+def _fetch(url, timeout=120, *, attempts=3, sleep=time.sleep):
+    """GET a whole response; transient network errors are retried with a growing pause."""
+    for attempt in range(1, attempts + 1):
+        try:
+            request = urllib.request.Request(url, headers={"User-Agent": "rsvt-research-client"})
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return response.read()
+        except (OSError, http.client.HTTPException):
+            if attempt == attempts:
+                raise
+            sleep(15 * attempt)
 
 
 def folder_series_hint(dicom_path):
@@ -601,11 +610,99 @@ class _SampleState:
                 "problems": problems, "eligible": not problems}
 
 
-def open_archive_stream(source, *, timeout=300):
-    """URL or local .tgz path -> binary stream (caller closes)."""
+class StreamResumeError(OSError):
+    """The server cannot continue the same file at the same byte; resuming would splice different data."""
+
+
+class ResumingHTTPStream(io.RawIOBase):
+    """Read-only HTTP stream that reconnects at the same byte offset after a network error.
+
+    The author archives are 153-183 GB gzip streams that must be read in one pass.
+    Without this, a dropped connection restarted the whole archive from byte 0.
+    A reconnect asks for `Range: bytes=<offset>-`. It continues only if the server
+    answers 206 starting at exactly that offset, with the same total size and the
+    same ETag or Last-Modified as the first response; otherwise the stream stops
+    instead of joining bytes from a different file. Decompression above this
+    reader never sees the interruption. A VM restart still starts the current
+    archive again (finished samples are skipped).
+    """
+
+    def __init__(self, url, *, timeout=120, retries=10, backoff=10., opener=urllib.request.urlopen, sleep=time.sleep):
+        self.url, self.timeout, self.retries, self.backoff = str(url), timeout, retries, backoff
+        self._opener, self._sleep = opener, sleep
+        self.position, self.reconnects, self.total = 0, 0, None
+        self._identity, self._response = None, None
+        self._open()
+
+    def readable(self):
+        return True
+
+    def _open(self):
+        headers = {"User-Agent": "rsvt-research-client"}
+        if self.position:
+            headers["Range"] = f"bytes={self.position}-"
+        response = self._opener(urllib.request.Request(self.url, headers=headers), timeout=self.timeout)
+        status = getattr(response, "status", None) or response.getcode()
+        if self.position:
+            match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", str(response.headers.get("Content-Range", "")).strip())
+            if status != 206 or not match or int(match.group(1)) != self.position:
+                response.close()
+                raise StreamResumeError(f"Server did not resume at byte {self.position} (HTTP {status}); "
+                                        "the archive must be streamed again from the start")
+            total = int(match.group(3))
+        else:
+            if status != 200:
+                response.close()
+                raise StreamResumeError(f"Unexpected HTTP {status} for {self.url}")
+            length = response.headers.get("Content-Length")
+            total = int(length) if length else None
+        identity = (total, response.headers.get("ETag") or response.headers.get("Last-Modified"))
+        if self._identity is not None and identity != self._identity:
+            response.close()
+            raise StreamResumeError("The archive changed on the server while it was being streamed")
+        self._identity, self.total, self._response = identity, total, response
+
+    def _drop(self):
+        if self._response is not None:
+            try:
+                self._response.close()
+            except Exception:
+                pass
+        self._response = None
+
+    def readinto(self, buffer):
+        failures = 0
+        while True:
+            try:
+                if self._response is None:
+                    self._open()
+                count = self._response.readinto(buffer)
+                if not count and self.total is not None and self.position < self.total:
+                    raise http.client.IncompleteRead(b"", self.total - self.position)
+                self.position += count
+                return count
+            except StreamResumeError:
+                raise
+            except (OSError, http.client.HTTPException) as exc:
+                failures += 1
+                self._drop()
+                if failures > self.retries:
+                    raise OSError(f"Archive stream failed at byte {self.position:,} after "
+                                  f"{failures - 1} reconnect attempts") from exc
+                self.reconnects += 1
+                self._sleep(min(self.backoff * failures, 120.))
+
+    def close(self):
+        self._drop()
+        super().close()
+
+
+def open_archive_stream(source, *, timeout=120, opener=None, sleep=None):
+    """URL or local .tgz path -> buffered binary stream (caller closes). URLs reconnect where they stopped."""
     if str(source).startswith(("http://", "https://")):
-        request = urllib.request.Request(str(source), headers={"User-Agent": "rsvt-research-client"})
-        return urllib.request.urlopen(request, timeout=timeout)
+        raw = ResumingHTTPStream(source, timeout=timeout, opener=opener or urllib.request.urlopen,
+                                 sleep=sleep or time.sleep)
+        return io.BufferedReader(raw, buffer_size=1 << 20)
     return Path(source).open("rb")
 
 
@@ -641,6 +738,7 @@ def stream_generator(generator, samples, real_meta, store_root, work_root, *, so
                 continue
         wanted[sample["img_id"]] = sample
     states, finished, members, started = {}, Counter(), 0, time.time()
+    reader = {}  # the HTTP reader, for bytes read and reconnects
     partial = work_root / "partial" / generator
     if partial.exists():
         shutil.rmtree(partial)  # a previous interrupted stream restarts from the archive start
@@ -686,9 +784,15 @@ def stream_generator(generator, samples, real_meta, store_root, work_root, *, so
             state.spill(partial / img_id)
             del states[img_id]
         if progress and members % progress_every == 0:
-            progress({"stage": "archive", "generator": generator, "members": members, "open_samples": len(states),
-                      "finished": dict(finished), "remaining": len(wanted) - sum(finished.values()),
-                      "elapsed_s": round(time.time() - started)})
+            event = {"stage": "archive", "generator": generator, "members": members, "open_samples": len(states),
+                     "finished": dict(finished), "remaining": len(wanted) - sum(finished.values()),
+                     "elapsed_s": round(time.time() - started)}
+            raw = reader.get("raw")
+            if raw is not None:
+                event.update(archive_gb_read=round(raw.position / 1e9, 2), reconnects=raw.reconnects,
+                             archive_gb_total=round(raw.total / 1e9, 1) if raw.total else None,
+                             mb_per_s=round(raw.position / 1e6 / max(time.time() - started, 1e-6), 1))
+            progress(event)
 
     if not wanted:
         summary = {"generator": generator, "status": "already_complete", "finished": {}}
@@ -699,6 +803,8 @@ def stream_generator(generator, samples, real_meta, store_root, work_root, *, so
             handle(name, read)
     else:
         stream = open_archive_stream(source or f"{ARCHIVE_BASE}/{generator}.tgz")
+        raw = getattr(stream, "raw", None)
+        reader["raw"] = raw if isinstance(raw, ResumingHTTPStream) else None
         try:
             with tarfile.open(fileobj=stream, mode="r|gz") as archive:
                 for member in archive:
@@ -720,6 +826,8 @@ def stream_generator(generator, samples, real_meta, store_root, work_root, *, so
                "members_read": members, "finished": dict(finished), "missing_from_archive": missing,
                "elapsed_s": round(time.time() - started), "half_mm": half_mm,
                "completed_utc": datetime.now(timezone.utc).isoformat()}
+    if reader.get("raw") is not None:
+        summary.update(archive_bytes_read=reader["raw"].position, reconnects=reader["raw"].reconnects)
     write_json(folder / "stream_summary.json", summary)
     return summary
 

@@ -41,6 +41,10 @@ patient-disjoint partitions are used: train 488 / validation 100 / test 150 pati
    161 GB) are streamed once; they are not seekable, so the full archive is
    transferred even for a subset. For each selected sample only a box of
    ±48 mm around the author manipulation centre and the author voxel mask are kept.
+   After a network error the download reconnects with an HTTP Range request at
+   the byte where it stopped, but only if the server resumes the same file (same
+   size and ETag/Last-Modified); otherwise it stops rather than splice data. A
+   runtime restart reads the current archive again; finished samples are skipped.
 3. **Verification while streaming**: every manipulated slice is compared with the
    real slice. A sample is eligible only if all changed voxels lie inside the box,
    the mask lies inside the box, slice counts and shapes match and the mask is not

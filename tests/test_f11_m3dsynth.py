@@ -9,6 +9,7 @@ from io import BytesIO
 import json
 import math
 from pathlib import Path
+import re
 import sys
 import tarfile
 from tempfile import TemporaryDirectory
@@ -175,6 +176,109 @@ def small_config(**training):
         "evaluation": {"fpr_targets": [.5]}}
     config["training"].update(training)
     return config
+
+
+class FakeResponse:
+    def __init__(self, data, start, status, headers, stop):
+        self.data, self.pos, self.status, self.headers, self.stop = data, start, status, headers, stop
+
+    def readinto(self, buffer):
+        if self.stop is not None and self.pos >= self.stop:
+            raise ConnectionResetError("simulated dropped connection")
+        end = len(self.data) if self.stop is None else min(len(self.data), self.stop)
+        count = min(len(buffer), end - self.pos)
+        buffer[:count] = self.data[self.pos:self.pos + count]
+        self.pos += count
+        return count
+
+    def close(self):
+        pass
+
+
+class FakeServer:
+    """Serves bytes with HTTP Range support and drops each connection at the next listed offset."""
+
+    def __init__(self, data, *, drops=(), honour_range=True, change_etag_on_reconnect=False):
+        self.data, self.drops = data, list(drops)
+        self.honour_range, self.change_etag = honour_range, change_etag_on_reconnect
+        self.ranges = []
+
+    def __call__(self, request, timeout=None):
+        wanted = request.get_header("Range")
+        self.ranges.append(wanted)
+        etag = '"v2"' if self.change_etag and len(self.ranges) > 1 else '"v1"'
+        stop = self.drops.pop(0) if self.drops else None
+        if not wanted or not self.honour_range:
+            return FakeResponse(self.data, 0, 200, {"Content-Length": str(len(self.data)), "ETag": etag}, stop)
+        start = int(re.fullmatch(r"bytes=(\d+)-", wanted).group(1))
+        return FakeResponse(self.data, start, 206,
+                            {"Content-Range": f"bytes {start}-{len(self.data) - 1}/{len(self.data)}", "ETag": etag}, stop)
+
+
+class ResumableArchiveStream(unittest.TestCase):
+    @staticmethod
+    def archive():
+        rng = np.random.default_rng(3)
+        members = {f"cycle/scan/inj_{i}/slide{z:04d}.tiff": rng.integers(0, 256, 70_000, dtype=np.uint8).tobytes()
+                   for i in range(3) for z in range(4)}
+        buffer = BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+            for name, data in members.items():
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                tar.addfile(info, BytesIO(data))
+        return buffer.getvalue(), members
+
+    def test_reconnects_at_the_same_byte_and_decodes_every_member(self):
+        data, members = self.archive()
+        drops = [len(data) // 5, len(data) // 2, len(data) * 4 // 5]
+        server = FakeServer(data, drops=drops)
+        stream = store_mod.open_archive_stream("https://example.invalid/cycle.tgz", opener=server, sleep=lambda s: None)
+        with tarfile.open(fileobj=stream, mode="r|gz") as tar:
+            seen = {m.name: tar.extractfile(m).read() for m in tar if m.isfile()}
+        self.assertEqual(seen, members)
+        self.assertEqual(server.ranges, [None] + [f"bytes={d}-" for d in drops])  # resumed exactly where each drop hit
+        self.assertEqual((stream.raw.reconnects, stream.raw.position), (3, len(data)))
+        stream.close()
+
+    def test_tcia_downloads_retry_transient_errors(self):
+        class Body:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return b"series zip"
+
+        calls = []
+
+        def flaky(request, timeout=None):
+            calls.append(request.full_url)
+            if len(calls) < 3:
+                raise ConnectionResetError("simulated drop")
+            return Body()
+
+        with mock.patch.object(store_mod.urllib.request, "urlopen", flaky):
+            self.assertEqual(store_mod._fetch("https://example.invalid/getImage", sleep=lambda s: None), b"series zip")
+        self.assertEqual(len(calls), 3)
+        with mock.patch.object(store_mod.urllib.request, "urlopen", side_effect=TimeoutError("stalled")):
+            with self.assertRaises(TimeoutError):
+                store_mod._fetch("https://example.invalid/getImage", sleep=lambda s: None)
+
+    def test_refuses_to_splice_or_retry_forever(self):
+        data, _ = self.archive()
+        cases = ((dict(honour_range=False), store_mod.StreamResumeError, "did not resume"),
+                 (dict(change_etag_on_reconnect=True), store_mod.StreamResumeError, "changed on the server"),
+                 (dict(drops=[100] * 20), OSError, "after 10 reconnect attempts"))
+        for settings, error, message in cases:
+            with self.subTest(settings=settings):
+                settings.setdefault("drops", [len(data) // 3])
+                stream = store_mod.open_archive_stream("https://example.invalid/x.tgz", opener=FakeServer(data, **settings),
+                                                       sleep=lambda s: None)
+                with self.assertRaisesRegex(error, message):
+                    stream.read()
 
 
 class Conversion(unittest.TestCase):
@@ -523,6 +627,23 @@ class DiagnosticsAndNotebook(unittest.TestCase):
         image[0, 4, 8, 8] = 1.
         degraded = degrade(image[None], [[4., 4., 4.]])
         self.assertLess(float(degraded.max()), .2)  # a one-voxel trace does not survive coarse voxels
+
+    def test_flaky_http_stream_stores_the_same_boxes_as_a_clean_stream(self):
+        data = (self.fx.root / "cycle.tgz").read_bytes()
+        server = FakeServer(data, drops=[len(data) // 4, len(data) // 2, len(data) * 3 // 4])
+        real_meta = {s["series_key"]: json.loads((self.fx.store / "real" / (s["series_key"] + ".json")).read_text(encoding="utf-8"))
+                     for s in self.fx.selection["series"]}
+        store = Path(self.tmp.name) / "store_http"
+        with mock.patch.object(store_mod.urllib.request, "urlopen", server), mock.patch.object(store_mod.time, "sleep", lambda s: None):
+            summary = store_mod.stream_generator("cycle", self.fx.selection["samples"], real_meta, store, self.fx.work,
+                                                 source="https://example.invalid/cycle.tgz", half_mm=12.)
+        self.assertEqual((summary["status"], summary["reconnects"], summary["archive_bytes_read"]), ("complete", 3, len(data)))
+        clean = sorted(p for p in (self.fx.store / "boxes/cycle").glob("*.json") if p.name != "stream_summary.json")
+        self.assertEqual(len(clean), len(SITES))
+        for path in clean:
+            a, b = (json.loads(p.read_text(encoding="utf-8")) for p in (path, store / "boxes/cycle" / path.name))
+            for key in ("box_content_sha256", "eligible", "diff_voxels", "mask_voxels", "mask_bbox"):
+                self.assertEqual(a[key], b[key], (path.name, key))
 
     def test_resolution_pairs_match_appearance_not_location(self):
         from rsvt.experiments.m3d_diagnostics import MATCHED_SITE, _pairs
