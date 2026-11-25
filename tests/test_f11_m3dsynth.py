@@ -24,6 +24,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from rsvt.data import m3dsynth_store as store_mod
+from rsvt.data.m3dsynth_store import write_json
 from rsvt.data.m3dsynth_dataset import (AreaResampler, M3DDataset, M3DStore, VolumeCase, _rng, coarse_builder,
                                         intensity_lut)
 from rsvt.losses.endpoint_risk import dice_bce, generator_variance, grouped_tail_risk
@@ -659,6 +660,34 @@ class DiagnosticsAndNotebook(unittest.TestCase):
             self.assertTrue(record["same_series"])
         self.assertEqual(labels.tolist(), [1., 0.] * 4)
 
+    def test_verify_dataset_recovers_the_trailing_label_slice_artefact(self):
+        import shutil as _shutil
+        from rsvt.training.m3d_notebook import M3DNotebookSession
+        root = Path(self.tmp.name)
+        store = root / "recover_store"
+        _shutil.copytree(self.fx.store, store)
+        receipt_path = store / "boxes/cycle/rem_1.json"
+        record = json.loads(receipt_path.read_text(encoding="utf-8"))
+        depth = json.loads((store / "real" / f"{record['series_key']}.json").read_text(encoding="utf-8"))["shape_zyx"][0]
+        record["eligible"] = False
+        record["problems"] = [f"label slice {depth} outside the real depth or repeated"]
+        receipt_path.write_text(json.dumps(record), encoding="utf-8")
+        (root / "recover_project/outputs/rsvt_training").mkdir(parents=True)
+        repo = Path(__file__).resolve().parents[1]
+        session = M3DNotebookSession(root / "recover_project", repo, configuration=small_config(), epochs=2,
+                                     learning_rate=1e-3, patience=0, seed=13, patients_train=2, patients_validation=1,
+                                     generators=GENS, metadata_dir=self.fx.meta_dir, lidc_root=self.fx.lidc,
+                                     enforce_drive=False, display_enabled=False, store_root=store,
+                                     cache_root=root / "recover_cache")
+        manifest = session.verify_dataset()
+        recovered = json.loads(receipt_path.read_text(encoding="utf-8"))
+        self.assertTrue(recovered["eligible"])
+        self.assertEqual(recovered["accepted_problem"], f"label slice {depth} outside the real depth or repeated")
+        volume = next(v for v in manifest["volumes"] if v.get("img_id") == "rem_1" and v.get("generator") == "cycle")
+        self.assertTrue(volume["eligible"])
+        again = session.verify_dataset()  # idempotent: nothing left to recover
+        self.assertEqual(again["counts"]["eligible"], manifest["counts"]["eligible"])
+
     def test_run_all_decides_stages_from_saved_state(self):
         from rsvt.experiments import m3d_diagnostics
         from rsvt.training.m3d_notebook import M3DNotebookSession
@@ -731,6 +760,58 @@ class DiagnosticsAndNotebook(unittest.TestCase):
         self.assertIn("training/summary.json", records)
         self.assertIn("figures/learning_curves.png", records)
         self.assertTrue(session.train()["training_finished"])  # re-run reuses the finished session
+
+
+class ReclassifyExtraLabelSlice(unittest.TestCase):
+    def setUp(self):
+        self.tmp = TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        (self.root / "real").mkdir(parents=True)
+        for generator in store_mod.GENERATORS:
+            (self.root / "boxes" / generator).mkdir(parents=True)
+        write_json(self.root / "real" / "PATIENT__100.json", {"shape_zyx": [100, 512, 512]})
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def receipt(self, generator, img_id, series_key, problems, *, eligible=False, accepted_reason=None):
+        record = {"img_id": img_id, "generator": generator, "series_key": series_key, "eligible": eligible,
+                 "problems": problems}
+        if accepted_reason:
+            record["accepted_reason"] = accepted_reason
+        write_json(self.root / "boxes" / generator / f"{img_id}.json", record)
+
+    def test_only_the_exact_trailing_slice_pattern_is_accepted(self):
+        self.receipt("cycle", "rem_1", "PATIENT__100", ["label slice 100 outside the real depth or repeated"])
+        self.receipt("cycle", "rem_2", "PATIENT__100", ["label slice 101 outside the real depth or repeated"])  # not at depth
+        self.receipt("cycle", "rem_3", "PATIENT__100",
+                    ["label slice 100 outside the real depth or repeated", "5 changed voxels outside the stored box"])  # two problems
+        self.receipt("pix2pix", "inj_1", "PATIENT__100", [], eligible=True)  # already eligible, untouched
+        self.receipt("diffusion", "inj_2", "PATIENT__100",
+                    ["label slice 100 outside the real depth or repeated"], accepted_reason="earlier_run")  # already accepted
+        result = store_mod.reclassify_extra_label_slice(self.root)
+        self.assertEqual(result["scanned"], 5)
+        self.assertEqual(result["accepted"], 1)
+        accepted = json.loads((self.root / "boxes/cycle/rem_1.json").read_text(encoding="utf-8"))
+        self.assertTrue(accepted["eligible"])
+        self.assertEqual(accepted["problems"], [])
+        self.assertEqual(accepted["accepted_problem"], "label slice 100 outside the real depth or repeated")
+        for name in ("rem_2", "rem_3"):
+            untouched = json.loads((self.root / f"boxes/cycle/{name}.json").read_text(encoding="utf-8"))
+            self.assertFalse(untouched["eligible"])
+        kept = json.loads((self.root / "boxes/diffusion/inj_2.json").read_text(encoding="utf-8"))
+        self.assertEqual(kept["accepted_reason"], "earlier_run")  # not re-accepted, not re-counted
+
+    def test_running_twice_changes_nothing_the_second_time(self):
+        self.receipt("cycle", "rem_1", "PATIENT__100", ["label slice 100 outside the real depth or repeated"])
+        first = store_mod.reclassify_extra_label_slice(self.root)
+        second = store_mod.reclassify_extra_label_slice(self.root)
+        self.assertEqual((first["accepted"], second["accepted"]), (1, 0))
+
+    def test_unknown_series_depth_is_left_ineligible(self):
+        self.receipt("cycle", "rem_1", "OTHER_PATIENT__1", ["label slice 100 outside the real depth or repeated"])
+        result = store_mod.reclassify_extra_label_slice(self.root)
+        self.assertEqual(result["accepted"], 0)
 
 
 class LegacyRouterFixes(unittest.TestCase):

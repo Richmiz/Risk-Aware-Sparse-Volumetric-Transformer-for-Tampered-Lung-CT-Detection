@@ -835,6 +835,56 @@ def stream_generator(generator, samples, real_meta, store_root, work_root, *, so
 # --------------------------------------------------------------------------- manifest
 
 
+_EXTRA_LABEL_SLICE = re.compile(r"^label slice (\d+) outside the real depth or repeated$")
+
+
+def reclassify_extra_label_slice(store_root):
+    """Accept one harmless artefact: exactly one label slice numbered at the scan's own depth.
+
+    In the 24-25 November 2026 acquisition, 2,700 of 3,434 ineligible samples (79%) failed
+    for this reason alone: the author label export appends one slice beyond the last real
+    scan slice (always indexed exactly at the scan depth, never anywhere else). Scan
+    comparison, mask comparison, box containment and non-emptiness all already passed for
+    these samples; nothing is re-read or re-streamed. The original problem text is kept as
+    `accepted_problem` so this is an audited correction, not a silent one. Already-eligible
+    and already-accepted receipts, and any sample with more than this one problem, are left
+    untouched, so running this more than once is safe.
+    """
+    store_root = Path(store_root)
+    shapes, accepted, scanned = {}, [], 0
+    for generator in GENERATORS:
+        folder = store_root / "boxes" / generator
+        if not folder.exists():
+            continue
+        for path in sorted(folder.glob("*.json")):
+            if path.name == "stream_summary.json":
+                continue
+            scanned += 1
+            record = json.loads(path.read_text(encoding="utf-8"))
+            if record.get("eligible") or record.get("accepted_reason"):
+                continue
+            problems = record.get("problems") or []
+            if len(problems) != 1:
+                continue
+            match = _EXTRA_LABEL_SLICE.match(problems[0])
+            if not match:
+                continue
+            series_key = record["series_key"]
+            if series_key not in shapes:
+                real = store_root / "real" / (series_key + ".json")
+                shapes[series_key] = json.loads(real.read_text(encoding="utf-8"))["shape_zyx"][0] if real.exists() else None
+            depth = shapes[series_key]
+            if depth is None or int(match.group(1)) != depth:
+                continue
+            record["eligible"] = True
+            record["accepted_reason"] = "trailing_label_slice_at_scan_depth"
+            record["accepted_problem"] = problems[0]
+            record["problems"] = []
+            write_json(path, record)
+            accepted.append(f"{generator}:{record['img_id']}")
+    return {"scanned": scanned, "accepted": len(accepted), "examples": accepted[:10]}
+
+
 def build_manifest(store_root, selection, meta):
     """One JSON manifest of authentic volumes, manipulated volumes and authentic sites."""
     store_root = Path(store_root)
