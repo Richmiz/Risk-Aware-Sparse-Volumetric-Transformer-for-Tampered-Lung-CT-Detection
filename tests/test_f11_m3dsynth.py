@@ -4,6 +4,7 @@ Procedural CT series and TIFF archives only; no medical images are read.
 """
 
 import csv
+import errno
 import hashlib
 from io import BytesIO
 import json
@@ -658,6 +659,61 @@ class DiagnosticsAndNotebook(unittest.TestCase):
             self.assertNotEqual(record["volume_id"].split(":")[1], record["authentic_site"])  # never its own location
             self.assertTrue(record["same_series"])
         self.assertEqual(labels.tolist(), [1., 0.] * 4)
+
+    def drive_session(self, name):
+        from rsvt.training.m3d_notebook import M3DNotebookSession
+        root = Path(self.tmp.name)
+        (root / name / "outputs/rsvt_training").mkdir(parents=True)
+        return M3DNotebookSession(root / name, Path(__file__).resolve().parents[1], configuration=small_config(), epochs=2,
+                                  learning_rate=1e-3, patience=0, seed=13, patients_train=2, patients_validation=1,
+                                  generators=GENS, metadata_dir=self.fx.meta_dir, lidc_root=self.fx.lidc, enforce_drive=False,
+                                  display_enabled=False, store_root=root / (name + "_store"), cache_root=root / (name + "_cache"))
+
+    def test_space_needed_counts_only_what_is_missing(self):
+        session = self.drive_session("space")
+        need = lambda: session.check_storage(stop=False)["locations"]["Google Drive"]["needed_gb"]
+        everything = need()
+        for series in session.selection["series"]:
+            path = session.store_root / "real" / (series["series_key"] + ".npz")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"x")
+        self.assertLess(need(), everything)
+        (session.store_root / "boxes" / "cycle").mkdir(parents=True)  # boxes kept from an earlier rule are not progress
+        before = need()
+        (session.store_root / "boxes/cycle/rem_1.npz").write_bytes(b"x" * 10 ** 6)
+        self.assertEqual(need(), before)
+        self.assertIs(session.check_storage(stop=False)["locations"]["Google Drive"]["quota_reported"], False)  # same disk here
+
+    def test_lost_drive_stops_at_once_and_never_streams(self):
+        session = self.drive_session("drive_lost")
+        calls = []
+
+        def gone(*args, **kwargs):
+            calls.append(1)
+            raise OSError(errno.ENOTCONN, "Transport endpoint is not connected")
+
+        with mock.patch.object(store_mod, "acquire_real_series", gone),                 mock.patch.object(store_mod, "stream_generator", side_effect=AssertionError("streamed without the scans")):
+            with self.assertRaisesRegex(RuntimeError, "Google Drive disconnected"):
+                session.prepare_data()
+        self.assertEqual(len(calls), 1)  # the first lost read, not one per scan
+        self.assertFalse((session.store_root / "real_acquisition_failures.json").exists())
+
+    def test_drive_lost_while_streaming_is_named(self):
+        session = self.drive_session("drive_lost_stream")
+        with mock.patch.object(store_mod, "stream_generator", side_effect=OSError(errno.ENOTCONN, "Transport endpoint is not connected")):
+            with self.assertRaisesRegex(RuntimeError, "Google Drive disconnected"):
+                session.prepare_data()
+        with mock.patch.object(store_mod, "stream_generator", side_effect=OSError("Archive stream failed at byte 5")):
+            with self.assertRaisesRegex(OSError, "Archive stream failed"):  # a server problem keeps its own message
+                session.prepare_data()
+
+    def test_too_many_failed_scans_stop_before_streaming(self):
+        session = self.drive_session("many_failed")
+        with mock.patch.object(store_mod, "acquire_real_series", side_effect=ValueError("SeriesNumber differs")),                 mock.patch.object(store_mod, "stream_generator", side_effect=AssertionError("streamed without the scans")):
+            with self.assertRaisesRegex(RuntimeError, "3 of 3 LIDC scans failed.*SeriesNumber differs"):
+                session.prepare_data()
+        recorded = json.loads((session.store_root / "real_acquisition_failures.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(recorded), 3)  # genuine scan failures are still listed
 
     def test_run_all_decides_stages_from_saved_state(self):
         from rsvt.experiments import m3d_diagnostics

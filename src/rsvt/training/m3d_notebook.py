@@ -9,9 +9,11 @@ from __future__ import annotations
 from collections import Counter
 from copy import deepcopy
 from datetime import datetime, timezone
+import errno
 from html import escape
 from io import BytesIO
 import json
+import os
 from pathlib import Path
 import platform
 import shutil
@@ -153,7 +155,9 @@ class M3DNotebookSession:
         rows.append(("Dataset store now", "complete for this selection" if status["complete"] else status["reason"]))
         if not status["complete"]:
             space = self.check_storage(stop=False)
-            rows += [(f"Free space: {name}", f"{info['free_gb']} GB free, about {info['needed_gb']} GB needed")
+            rows += [(f"Free space: {name}", f"about {info['needed_gb']} GB needed; Colab does not show your Drive quota here, "
+                      "so check it yourself" if info.get("quota_reported") is False else
+                      f"{info['free_gb']} GB free, about {info['needed_gb']} GB needed")
                      for name, info in space["locations"].items()]
         self._html("<h3>M3Dsynth data plan</h3>" + table_html(["Item", "Value"], rows))
         self._save_json("data_plan.json", {"selection_counts": counts, "estimate": estimate, "store_status": status,
@@ -184,10 +188,14 @@ class M3DNotebookSession:
     def check_storage(self, *, stop=True, margin_gb=2.):
         """Compare free Drive and runtime-disk space with what the download still needs."""
         estimate = store_mod.storage_estimate(self.selection)
-        # Boxes kept from an earlier rule do not reduce what this rule still has to store.
-        used = sum(p.stat().st_size for folder in ("real", "coarse", store_mod.BOX_FOLDER)
-                   for p in (self.store_root / folder).rglob("*") if p.is_file()) / 1e9
-        needs = {"Google Drive": (self.project, max(0., estimate["estimated_drive_gb"] - used) + margin_gb),
+        # Only what is still missing: LIDC scans without a file and samples without a box under the current folder.
+        def missing(folder, names):
+            return sum(not (self.store_root / folder / (name + ".npz")).exists() for name in names)
+        scans = missing("real", [s["series_key"] for s in self.selection["series"]])
+        boxes = sum(missing(f"{store_mod.BOX_FOLDER}/{g}", [s["img_id"] for s in self.selection["samples"] if s["variant"] == g])
+                    for g in self.selection["generators"])
+        left = store_mod.storage_estimate({**self.selection, "series": [None] * scans, "samples": [None] * boxes})
+        needs = {"Google Drive": (self.project, left["estimated_drive_gb"] * 1.0737 + margin_gb),
                  # uncompressed series (~80 MB each) stay on the runtime disk while the archives stream
                  "runtime disk": (self.cache_root, estimate["real_series"] * .08 + margin_gb)}
         locations, problems = {}, []
@@ -200,6 +208,9 @@ class M3DNotebookSession:
                                "needed_gb": round(needed, 1)}
             if usage.total and usage.free < needed * 1e9:  # a size of 0 means the mount does not report space
                 problems.append(f"{name}: {usage.free / 1e9:.1f} GB free, about {needed:.1f} GB needed")
+        # A mount that repeats the runtime disk's size is not showing the Drive quota.
+        reported = locations["Google Drive"]["total_gb"] != locations["runtime disk"]["total_gb"]
+        locations["Google Drive"]["quota_reported"] = reported
         report = {"locations": locations, "problems": problems}
         self._save_json("storage_check.json", report)
         if stop and problems:
@@ -238,21 +249,44 @@ class M3DNotebookSession:
                 real_meta[item["series_key"]] = store_mod.acquire_real_series(
                     item, self.store_root, self.work_root, lidc_root=self.lidc_root, base=tcia_base, coarse_builder=build)
             except Exception as exc:  # one bad series must not abort the rest; it is reported and excluded
+                self._stop_if_drive_lost(exc, f"after {i - 1} of {len(self.selection['series'])} LIDC scans")
                 failures.append({"series_key": item["series_key"], "reason": str(exc)})
             report({"stage": "real_series", "done": i, "of": len(self.selection["series"]), "failed": len(failures)})
         write_json(self.store_root / "real_acquisition_failures.json", failures)
+        if len(failures) > .05 * len(self.selection["series"]):  # the archives take hours and depend on these scans
+            reasons = Counter(f["reason"][:120] for f in failures).most_common(3)
+            raise RuntimeError(f"{len(failures)} of {len(self.selection['series'])} LIDC scans failed, so the archives were "
+                               "not streamed. Most common reasons: " + "; ".join(f"{n}x {text}" for text, n in reasons))
         available = [s for s in self.selection["samples"] if s["series_key"] in real_meta]
         streams = {}
         for generator in generators or self.selection["generators"]:
             source = (archive_sources or {}).get(generator)
-            streams[generator] = store_mod.stream_generator(
-                generator, available, real_meta, self.store_root, self.work_root, source=source,
-                extracted_root=extracted_root, half_mm=self.config["acquisition"]["half_box_mm"],
-                cube_half_mm=self.config["acquisition"].get("cube_half_mm", 0.), progress=report)
+            try:
+                streams[generator] = store_mod.stream_generator(
+                    generator, available, real_meta, self.store_root, self.work_root, source=source,
+                    extracted_root=extracted_root, half_mm=self.config["acquisition"]["half_box_mm"],
+                    cube_half_mm=self.config["acquisition"].get("cube_half_mm", 0.), progress=report)
+            except OSError as exc:
+                self._stop_if_drive_lost(exc, f"while streaming {generator}")
+                raise
         manifest = store_mod.build_manifest(self.store_root, self.selection, self.meta)
         self._save_json("acquisition_report.json", {"real_series_ok": len(real_meta), "real_series_failed": failures,
                                                     "streams": streams, "manifest_counts": manifest["counts"]})
         return self.verify_dataset()
+
+    def _stop_if_drive_lost(self, exc, when):
+        """A dead Drive mount fails every later read too; stop now instead of blaming the data."""
+        if not isinstance(exc, OSError):
+            return
+        lost = exc.errno in (errno.ENOTCONN, errno.ESTALE, errno.ENODEV)
+        if not lost:
+            try:
+                os.stat(self.project)
+            except OSError:
+                lost = True
+        if lost:
+            raise RuntimeError(f"Google Drive disconnected {when}. Nothing is wrong with the data and finished samples are kept. "
+                               "Use Runtime > Disconnect and delete runtime, reconnect, and Run all.") from exc
 
     def verify_dataset(self):
         manifest = json.loads((self.store_root / "manifest.json").read_text(encoding="utf-8"))
