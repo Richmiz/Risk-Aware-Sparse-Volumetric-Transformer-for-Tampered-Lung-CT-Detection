@@ -247,13 +247,6 @@ class M3DNotebookSession:
         return self.verify_dataset()
 
     def verify_dataset(self):
-        reclassified = store_mod.reclassify_extra_label_slice(self.store_root)
-        if reclassified["accepted"]:
-            store_mod.build_manifest(self.store_root, self.selection, self.meta)
-            self._html(f"<p><b>Recovered {reclassified['accepted']} of {reclassified['scanned']} samples</b> that only "
-                       "differed by one harmless trailing label slice in the author export; everything else about them "
-                       "had already matched. The original finding is kept in each receipt.</p>")
-            self._save_json("label_slice_reclassification.json", reclassified)
         manifest = json.loads((self.store_root / "manifest.json").read_text(encoding="utf-8"))
         check = store_mod.verify_store(self.store_root, manifest)
         self._save_json("dataset_verification.json", {"manifest_sha256": sha256_path(self.store_root / "manifest.json"),
