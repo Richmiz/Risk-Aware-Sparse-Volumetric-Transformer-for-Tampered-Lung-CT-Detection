@@ -93,6 +93,17 @@ Made before any M3Dsynth image was downloaded or any model trained.
 | Checkpoint selection | Changed (supersedes 17 Nov) | Lowest validation volume BCE averaged over three equal groups (authentic, removal, insertion) among risk-stage epochs (hard top-K inference). The two-class balanced BCE is still reported |
 | Resolution check | Changed | Manipulated crops at declared site centres vs authentic sites of the same appearance (removal vs TB, insertion vs TM); results per operation. Pairing with the same location compared nodule vs no nodule |
 
+## Amendment 25 November 2026 — after the first acquisition
+
+The first acquisition (24–25 Nov) accepted 160 of 3,594 manipulated samples and no model was trained.
+
+| Decision | Status | Rule |
+|---|---|---|
+| Stored box | Changed | ±48 mm and at least 24 mm of in-plane pixels on every axis. "Cube taller than the old box" matched 448 of 453 removals that had changed voxels outside it; 26 of 26 receipts read fit the new box |
+| Label slices past the scan depth | Changed | Content is counted during streaming. Empty: accepted and recorded. With mask voxels: ineligible. The first run did not record their content, so its samples are streamed again rather than relabelled |
+| Whole-scan mismatches | Excluded, cause open | 98 samples (39 sites) differ from the LIDC series over more than 1 M voxels. All lie where the edit cube runs off the start of the scan; 172 other samples there do not mismatch |
+| Earlier boxes and manifest | Preserved | New boxes go to `boxes_v2`; every earlier manifest is kept in `manifest_history` |
+
 Kelanjutan QA 13 November: run `qa_20261113T005049_219029Z` telah direview dari
 Drive. Semua 103 file metadata cocok checksum; 300 hash header sampel cocok F01;
 123 preview tercatat (110 train/13 validation), 25 titik test dikecualikan.

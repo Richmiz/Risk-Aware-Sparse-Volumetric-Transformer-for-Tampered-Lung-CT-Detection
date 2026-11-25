@@ -394,7 +394,7 @@ class StoreAndDataset(unittest.TestCase):
         self.assertTrue(all(v["eligible"] and v["mask_voxels"] == 3 * 7 * 7 for v in good))
         self.assertTrue(store_mod.verify_store(self.fx.store, self.manifest)["ok"])
         self.assertEqual(self.manifest["patient_overlap_across_splits"], [])
-        summary = store_mod.stream_generator("cycle", self.fx.selection["samples"], {}, self.fx.store, self.fx.work,
+        summary = store_mod.stream_generator("cycle", self.fx.selection["samples"], {}, self.fx.store, self.fx.work, half_mm=12.,
                                              source=self.fx.root / "cycle.tgz")
         self.assertEqual(summary["status"], "already_complete")  # resume skips verified samples
 
@@ -638,10 +638,10 @@ class DiagnosticsAndNotebook(unittest.TestCase):
             summary = store_mod.stream_generator("cycle", self.fx.selection["samples"], real_meta, store, self.fx.work,
                                                  source="https://example.invalid/cycle.tgz", half_mm=12.)
         self.assertEqual((summary["status"], summary["reconnects"], summary["archive_bytes_read"]), ("complete", 3, len(data)))
-        clean = sorted(p for p in (self.fx.store / "boxes/cycle").glob("*.json") if p.name != "stream_summary.json")
+        clean = sorted(p for p in (self.fx.store / store_mod.BOX_FOLDER / "cycle").glob("*.json") if p.name != "stream_summary.json")
         self.assertEqual(len(clean), len(SITES))
         for path in clean:
-            a, b = (json.loads(p.read_text(encoding="utf-8")) for p in (path, store / "boxes/cycle" / path.name))
+            a, b = (json.loads(p.read_text(encoding="utf-8")) for p in (path, store / store_mod.BOX_FOLDER / "cycle" / path.name))
             for key in ("box_content_sha256", "eligible", "diff_voxels", "mask_voxels", "mask_bbox"):
                 self.assertEqual(a[key], b[key], (path.name, key))
 
@@ -731,6 +731,125 @@ class DiagnosticsAndNotebook(unittest.TestCase):
         self.assertIn("training/summary.json", records)
         self.assertIn("figures/learning_curves.png", records)
         self.assertTrue(session.train()["training_finished"])  # re-run reuses the finished session
+
+
+class BoxRuleAndLabelTail(unittest.TestCase):
+    """Deeper boxes, inspected label tails and re-streaming under a new rule (25 Nov 2026)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = TemporaryDirectory(ignore_cleanup_errors=True)
+        cls.fx = Fixture(cls.tmp.name)
+        cls.fx.acquire()
+        cls.real_meta = {s["series_key"]: json.loads((cls.fx.store / "real" / (s["series_key"] + ".json")).read_text(encoding="utf-8"))
+                         for s in cls.fx.selection["series"]}
+
+    @classmethod
+    def tearDownClass(cls):
+        import gc
+        gc.collect()
+        cls.tmp.cleanup()
+
+    def stream(self, name, *, tails, labels_first=True, edit=None, progress=None):
+        """Re-stream 'cycle'; `tails` maps img_id -> mask voxels in one label slice past the scan end."""
+        members = []
+        for img_id, patient, center in SITES:
+            scan, mask = self.fx.edits[("cycle", img_id)]
+            if edit and img_id in edit:
+                scan = edit[img_id](scan.copy())
+            label = [(f"cycle/label/{img_id}/slide{z:04d}.tiff", tiff(mask[z])) for z in range(SHAPE[0])]
+            scans = [(f"cycle/scan/{img_id}/slide{z:04d}.tiff", tiff(scan[z])) for z in range(SHAPE[0])]
+            extra = []
+            if img_id in tails:
+                tail = np.zeros(SHAPE[1:], dtype=mask.dtype)
+                tail.flat[:tails[img_id]] = 1
+                extra = [(f"cycle/label/{img_id}/slide{SHAPE[0]:04d}.tiff", tiff(tail))]
+            members += extra + label + scans if labels_first else scans + label + extra  # second: arrives after completion
+        archive = Path(self.tmp.name) / f"{name}.tgz"
+        with tarfile.open(archive, "w:gz") as tar:
+            for member, data in members:
+                info = tarfile.TarInfo(member)
+                info.size = len(data)
+                tar.addfile(info, BytesIO(data))
+        store = Path(self.tmp.name) / name
+        summary = store_mod.stream_generator("cycle", self.fx.selection["samples"], self.real_meta, store, self.fx.work,
+                                             source=archive, half_mm=12., progress=progress, progress_every=1)
+        folder = store / store_mod.BOX_FOLDER / "cycle"
+        return summary, {i: json.loads((folder / f"{i}.json").read_text(encoding="utf-8")) for i, _, _ in SITES}
+
+    def test_box_covers_a_voxel_cube_on_thick_slices_only_when_needed(self):
+        shape, center = (133, 512, 512), (60, 250, 250)
+        for spacing, depth in (((2.5, .78, .78), 31), ((3., .55, .55), 44), ((1., .78, .78), 48)):
+            start, stop = store_mod.box_for(center, shape, spacing, 48., 24.)
+            self.assertEqual((center[0] - start[0], stop[0] - 1 - center[0]), (depth, depth))
+            old = store_mod.box_for(center, shape, spacing, 48.)
+            self.assertEqual((start[1:], stop[1:]), (old[0][1:], old[1][1:]))  # in-plane extent unchanged
+        self.assertEqual(store_mod.box_for((3, 250, 250), shape, (2.5, .78, .78), 48., 24.)[0][0], 0)  # still clipped
+
+    def test_an_empty_label_tail_is_accepted_and_recorded_a_filled_one_is_not(self):
+        for order in (True, False):
+            with self.subTest(labels_first=order):
+                summary, receipts = self.stream(f"tail_{order}", tails={"rem_1": 0, "inj_2": 5}, labels_first=order)
+                self.assertTrue(receipts["rem_1"]["eligible"])
+                self.assertEqual((receipts["rem_1"]["label_tail_slices"], receipts["rem_1"]["label_tail_voxels"]), (1, 0))
+                self.assertFalse(receipts["inj_2"]["eligible"])
+                self.assertEqual(receipts["inj_2"]["problems"], ["5 mask voxels in label slices past the scan end"])
+                self.assertEqual((receipts["rem_3"]["eligible"], receipts["rem_3"]["label_tail_slices"]), (True, 0))
+                self.assertEqual(summary["label_tails"], {"empty": 1, "nonempty": 1})
+                self.assertEqual((summary["finished"]["eligible"], summary["finished"]["ineligible"]), (len(SITES) - 1, 1))
+                for img_id, record in receipts.items():  # a late slice must not replace the stored sample
+                    self.assertGreater(record["diff_voxels"], 0, img_id)
+
+    def test_label_tail_counts_are_visible_while_streaming(self):
+        events = []
+        self.stream("live", tails={"rem_1": 0, "inj_2": 5}, progress=events.append)
+        self.assertEqual(events[-1]["label_tails"], {"empty": 1, "nonempty": 1})
+        self.assertTrue(any(e["remaining"] and sum(e["label_tails"].values()) for e in events))  # before the end
+
+    def test_other_checks_stay_strict(self):
+        def far(scan):
+            scan[0, 0, 0] += 7
+            return scan
+        _, receipts = self.stream("strict", tails={"rem_1": 0}, edit={"rem_1": far})
+        self.assertFalse(receipts["rem_1"]["eligible"])  # an empty tail does not excuse a change outside the box
+        self.assertIn("changed voxels outside the stored box", " ".join(receipts["rem_1"]["problems"]))
+
+    def test_old_boxes_are_kept_and_an_earlier_rule_is_streamed_again(self):
+        store = Path(self.tmp.name) / "upgrade"
+        old = store / "boxes" / "cycle"
+        old.mkdir(parents=True)
+        (old / "rem_1.json").write_text('{"eligible": false}', encoding="utf-8")
+        (old / "rem_1.npz").write_bytes(b"old box")
+        summary, receipts = self.stream("upgrade", tails={})
+        self.assertEqual(sum(summary["finished"].values()), len(SITES))
+        self.assertEqual(((old / "rem_1.json").read_text(encoding="utf-8"), (old / "rem_1.npz").read_bytes()),
+                         ('{"eligible": false}', b"old box"))
+        self.assertEqual(receipts["rem_1"]["box_rule"], store_mod.box_rule(12., 0.))
+        common = dict(source=Path(self.tmp.name) / "upgrade.tgz", half_mm=12.)
+        args = ("cycle", self.fx.selection["samples"], self.real_meta, store, self.fx.work)
+        self.assertEqual(store_mod.stream_generator(*args, **common)["status"], "already_complete")  # same rule: skipped
+        again = store_mod.stream_generator(*args, **common, cube_half_mm=6.)
+        self.assertEqual(sum(again["finished"].values()), len(SITES))  # new rule: streamed again
+
+    def test_earlier_manifest_is_preserved_and_reported_as_an_earlier_rule(self):
+        from rsvt.training.m3d_notebook import M3DNotebookSession
+        root = Path(self.tmp.name)
+        (root / "rule_project/outputs/rsvt_training").mkdir(parents=True)
+        config = small_config()
+        config["acquisition"]["cube_half_mm"] = 6.
+        settings = dict(epochs=2, learning_rate=1e-3, patience=0, seed=13, patients_train=2, patients_validation=1,
+                        generators=GENS, metadata_dir=self.fx.meta_dir, lidc_root=self.fx.lidc, enforce_drive=False,
+                        display_enabled=False, store_root=self.fx.store, cache_root=root / "rule_cache")
+        repo = Path(__file__).resolve().parents[1]
+        same = M3DNotebookSession(root / "rule_project", repo, configuration=small_config(), **settings)
+        self.assertTrue(same.store_status()["complete"])
+        other = M3DNotebookSession(root / "rule_project", repo, configuration=config, **settings)
+        self.assertFalse(other.store_status()["complete"])
+        self.assertIn("earlier rule", other.store_status()["reason"])
+        before = store_mod.sha256_path(self.fx.store / "manifest.json")
+        store_mod.build_manifest(self.fx.store, self.fx.selection, self.fx.meta)
+        kept = self.fx.store / "manifest_history" / f"manifest_{before[:12]}.json"
+        self.assertEqual(store_mod.sha256_path(kept), before)
 
 
 class LegacyRouterFixes(unittest.TestCase):

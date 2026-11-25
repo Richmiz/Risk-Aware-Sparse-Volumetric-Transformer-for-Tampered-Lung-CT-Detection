@@ -56,6 +56,8 @@ CANDIDATE_OFFSETS = (0, 512, 1024, 2000, 2048)
 TCIA_BASE = "https://services.cancerimagingarchive.net/nbia-api/services/v1"
 ARCHIVE_BASE = "https://www.grip.unina.it/download/prog/M3Dsynth"
 ARCHIVE_SIZES_GB = {"cycle": 171, "pix2pix": 142, "diffusion": 161}
+# Boxes made under the 24 Nov 2026 rule stay untouched in "boxes"; newer ones go to their own folder.
+BOX_FOLDER = "boxes_v2"
 # Author metadata tables (no images) at a pinned commit of github.com/grip-unina/M3Dsynth.
 # The SHA-256 values are those of the copies audited on 11 Nov 2026, unchanged at this commit.
 METADATA_COMMIT = "f1461b74abac878fed45a3f0caf7bb4b72ff00d3"
@@ -97,6 +99,11 @@ def write_json(path, value):
     if path.read_text(encoding="utf-8") != text:
         raise OSError("JSON readback failed: " + str(path))
     return value
+
+
+def box_rule(half_mm, cube_half_mm):
+    """Identifies how a box was cut and checked; a receipt under another rule is streamed again."""
+    return f"v2;half_mm={float(half_mm):g};cube_half_mm={float(cube_half_mm):g};label_tail=inspected"
 
 
 def series_key(orig_id, sdir_id):
@@ -215,7 +222,7 @@ def select_subset(meta, *, patients_per_split, generators=GENERATORS, seed=13):
                        "real_sites": dict(Counter(s["split"] for s in sites))}}
 
 
-def storage_estimate(selection, *, real_mb=55., box_mb=1.6):
+def storage_estimate(selection, *, real_mb=55., box_mb=2.4):
     """Rough planning numbers shown before any download (not measured sizes)."""
     archives = {g: ARCHIVE_SIZES_GB[g] for g in selection["generators"]}
     return {"real_series": len(selection["series"]), "manipulated_samples": len(selection["samples"]),
@@ -488,11 +495,17 @@ def parse_member(name):
     return parts[-3], parts[-2], int(match.group(1))
 
 
-def box_for(center_zyx, shape_zyx, spacing_zyx, half_mm):
-    """Index box [start, stop) of +/- half_mm around the centre, clipped to the volume."""
+def box_for(center_zyx, shape_zyx, spacing_zyx, half_mm, cube_half_mm=0.):
+    """Index box [start, stop) of +/- half_mm around the centre, clipped to the volume.
+
+    Changed voxels were observed to fill a cube of about 41 mm in plane with the same number
+    of voxels along z (26 receipts, 25 Nov 2026), so on thick slices the edit is far deeper
+    than `half_mm`. Every axis therefore also covers `cube_half_mm` measured in in-plane pixels.
+    """
+    cube = int(math.ceil(cube_half_mm / max(min(float(s) for s in spacing_zyx[1:]), 1e-3)))
     start, stop = [], []
     for c, n, s in zip(center_zyx, shape_zyx, spacing_zyx):
-        half = int(math.ceil(half_mm / max(float(s), 1e-3)))
+        half = max(int(math.ceil(half_mm / max(float(s), 1e-3))), cube)
         start.append(max(0, int(c) - half))
         stop.append(min(int(n), int(c) + half + 1))
     if any(b <= a for a, b in zip(start, stop)):
@@ -500,12 +513,17 @@ def box_for(center_zyx, shape_zyx, spacing_zyx, half_mm):
     return start, stop
 
 
+def label_tail_problem(voxels):
+    return f"{voxels} mask voxels in label slices past the scan end"
+
+
 class _SampleState:
-    def __init__(self, sample, real_path, real_meta, half_mm):
+    def __init__(self, sample, real_path, real_meta, half_mm, cube_half_mm=0.):
         self.sample = sample
         self.real = np.load(real_path, mmap_mode="r")
         self.shape = tuple(real_meta["shape_zyx"])
-        self.start, self.stop = box_for(sample["center_zyx"], self.shape, real_meta["geometry"]["spacing_zyx"], half_mm)
+        self.start, self.stop = box_for(sample["center_zyx"], self.shape, real_meta["geometry"]["spacing_zyx"], half_mm,
+                                         cube_half_mm)
         size = [b - a for a, b in zip(self.start, self.stop)]
         self.box = np.zeros(size, dtype=np.uint16)
         self.mask = np.zeros(size, dtype=bool)
@@ -516,6 +534,8 @@ class _SampleState:
         self.mask_voxels = 0
         self.mask_outside = 0
         self.mask_bbox = None
+        self.label_tail_slices = 0
+        self.label_tail_voxels = 0
         self.problems = []
 
     @staticmethod
@@ -533,6 +553,12 @@ class _SampleState:
         return int(np.count_nonzero((rows < y0) | (rows >= y1) | (cols < x0) | (cols >= x1)))
 
     def add(self, kind, z, array):
+        if kind == "label" and z >= self.shape[0]:
+            # The authors' loader takes the depth from scan/ and never reads these slices. Count
+            # what they contain instead of assuming it: only empty ones are accepted (see result).
+            self.label_tail_slices += 1
+            self.label_tail_voxels += int(np.count_nonzero(array))
+            return
         if not 0 <= z < self.shape[0] or z in self.seen[kind]:
             self.problems.append(f"{kind} slice {z} outside the real depth or repeated")
             return
@@ -568,7 +594,8 @@ class _SampleState:
         started = [bool(self.seen[k]) for k in ("scan", "label")]
         return any(done) and not all(started)
 
-    _COUNTERS = ("diff_voxels", "diff_outside", "diff_bbox", "mask_voxels", "mask_outside", "mask_bbox", "problems")
+    _COUNTERS = ("diff_voxels", "diff_outside", "diff_bbox", "mask_voxels", "mask_outside", "mask_bbox",
+                 "label_tail_slices", "label_tail_voxels", "problems")
 
     def spill(self, path):
         """Persist a half-finished sample so RAM holds only samples currently streaming."""
@@ -598,6 +625,8 @@ class _SampleState:
             problems.append(f"{self.diff_outside} changed voxels outside the stored box")
         if self.mask_outside:
             problems.append(f"{self.mask_outside} mask voxels outside the stored box")
+        if self.label_tail_voxels:
+            problems.append(label_tail_problem(self.label_tail_voxels))
         if not self.mask_voxels:
             problems.append("empty author mask")
         if not self.diff_voxels:
@@ -606,6 +635,7 @@ class _SampleState:
         inside = self.mask_bbox is not None and all(lo <= c < hi for c, lo, hi in zip(center, *self.mask_bbox))
         return {"diff_voxels": self.diff_voxels, "diff_outside_box": self.diff_outside, "diff_bbox": self.diff_bbox,
                 "mask_voxels": self.mask_voxels, "mask_outside_box": self.mask_outside, "mask_bbox": self.mask_bbox,
+                "label_tail_slices": self.label_tail_slices, "label_tail_voxels": self.label_tail_voxels,
                 "center_inside_mask_bbox": inside, "box_start_zyx": self.start, "box_stop_zyx": self.stop,
                 "problems": problems, "eligible": not problems}
 
@@ -715,16 +745,17 @@ def iter_extracted_root(root, generator):
 
 
 def stream_generator(generator, samples, real_meta, store_root, work_root, *, source=None, extracted_root=None,
-                     half_mm=48., progress=None, progress_every=500):
+                     half_mm=48., cube_half_mm=0., progress=None, progress_every=500):
     """Stream one author archive and store verified boxes for the selected samples.
 
-    Resumable: samples with an existing verified receipt are skipped. The archive
-    is still transferred because gzip tar streams cannot seek.
+    Resumable: samples with a verified receipt made under the same box rule are skipped.
+    The archive is still transferred because gzip tar streams cannot seek.
     """
     if generator not in GENERATORS:
         raise ValueError("Unknown generator")
     store_root, work_root = Path(store_root), Path(work_root)
-    folder = store_root / "boxes" / generator
+    rule = box_rule(half_mm, cube_half_mm)
+    folder = store_root / BOX_FOLDER / generator
     folder.mkdir(parents=True, exist_ok=True)
     wanted = {}
     for sample in samples:
@@ -734,11 +765,12 @@ def stream_generator(generator, samples, real_meta, store_root, work_root, *, so
         if receipt.exists():
             stored = json.loads(receipt.read_text(encoding="utf-8"))
             box = folder / (sample["img_id"] + ".npz")
-            if box.exists() and sha256_path(box) == stored.get("file_sha256"):
+            if stored.get("box_rule") == rule and box.exists() and sha256_path(box) == stored.get("file_sha256"):
                 continue
         wanted[sample["img_id"]] = sample
     states, finished, members, started = {}, Counter(), 0, time.time()
     reader = {}  # the HTTP reader, for bytes read and reconnects
+    done, tails = set(), Counter()  # samples finished in this run; what their label tails held
     partial = work_root / "partial" / generator
     if partial.exists():
         shutil.rmtree(partial)  # a previous interrupted stream restarts from the archive start
@@ -754,11 +786,37 @@ def stream_generator(generator, samples, real_meta, store_root, work_root, *, so
         record = {"img_id": img_id, "generator": generator, "series_key": state.sample["series_key"],
                   "patient_id": state.sample["patient_id"], "split": state.sample["split"],
                   "operation": state.sample["operation"], "center_zyx": state.sample["center_zyx"],
-                  "half_mm": half_mm, **outcome, "file_sha256": sha256_path(box), "file_bytes": box.stat().st_size,
+                  "half_mm": half_mm, "cube_half_mm": cube_half_mm, "box_rule": rule, **outcome, "file_sha256": sha256_path(box), "file_bytes": box.stat().st_size,
                   "box_content_sha256": sha256_bytes(np.ascontiguousarray(state.box).tobytes()),
                   "created_utc": datetime.now(timezone.utc).isoformat()}
         write_json(folder / (img_id + ".json"), record)
         finished["eligible" if outcome["eligible"] else "ineligible"] += 1
+        done.add(img_id)
+        if outcome["label_tail_slices"]:
+            tails["nonempty" if outcome["label_tail_voxels"] else "empty"] += 1
+
+    def after_finish(img_id, kind, z, array):
+        """A slice that arrives once its sample is stored must correct the receipt, not restart the sample."""
+        path = folder / (img_id + ".json")
+        record = json.loads(path.read_text(encoding="utf-8"))
+        was_eligible, had_tail, had_voxels = record["eligible"], record["label_tail_slices"], record["label_tail_voxels"]
+        depth = real_meta[record["series_key"]]["shape_zyx"][0]
+        if kind == "label" and z >= depth:
+            record["label_tail_slices"] += 1
+            record["label_tail_voxels"] += int(np.count_nonzero(array))
+            if record["label_tail_voxels"]:
+                old = label_tail_problem(had_voxels)
+                record["problems"] = [p for p in record["problems"] if p != old] + [label_tail_problem(record["label_tail_voxels"])]
+            if had_tail:
+                tails["nonempty" if had_voxels else "empty"] -= 1
+            tails["nonempty" if record["label_tail_voxels"] else "empty"] += 1
+        else:
+            record["problems"].append(f"{kind} slice {z} outside the real depth or repeated")
+        record["eligible"] = not record["problems"]
+        if was_eligible and not record["eligible"]:
+            finished["eligible"] -= 1
+            finished["ineligible"] += 1
+        write_json(path, record)
 
     def handle(name, read):
         nonlocal members
@@ -769,10 +827,14 @@ def stream_generator(generator, samples, real_meta, store_root, work_root, *, so
         kind, img_id, z = parsed
         if img_id not in wanted:
             return
+        if img_id in done:
+            after_finish(img_id, kind, z, decode_tiff(read()))
+            return
         if img_id not in states:
             sample = wanted[img_id]
             meta = real_meta[sample["series_key"]]
-            states[img_id] = _SampleState(sample, work_root / "real" / (sample["series_key"] + ".npy"), meta, half_mm)
+            states[img_id] = _SampleState(sample, work_root / "real" / (sample["series_key"] + ".npy"), meta, half_mm,
+                                          cube_half_mm)
             spilled = partial / img_id
             if spilled.with_suffix(".json").exists():
                 states[img_id].restore(spilled)
@@ -786,6 +848,7 @@ def stream_generator(generator, samples, real_meta, store_root, work_root, *, so
         if progress and members % progress_every == 0:
             event = {"stage": "archive", "generator": generator, "members": members, "open_samples": len(states),
                      "finished": dict(finished), "remaining": len(wanted) - sum(finished.values()),
+                     "label_tails": {"empty": tails["empty"], "nonempty": tails["nonempty"]},
                      "elapsed_s": round(time.time() - started)}
             raw = reader.get("raw")
             if raw is not None:
@@ -817,14 +880,15 @@ def stream_generator(generator, samples, real_meta, store_root, work_root, *, so
         img_id = spilled.stem
         sample = wanted[img_id]
         states[img_id] = _SampleState(sample, work_root / "real" / (sample["series_key"] + ".npy"),
-                                      real_meta[sample["series_key"]], half_mm)
+                                      real_meta[sample["series_key"]], half_mm, cube_half_mm)
         states[img_id].restore(partial / img_id)
     for img_id in list(states):
         finish(img_id)  # incomplete samples are stored as ineligible with their problems
     missing = sorted(set(wanted) - {p.stem for p in folder.glob("*.json") if p.name != "stream_summary.json"})
     summary = {"generator": generator, "status": "complete" if not missing else "missing_samples",
                "members_read": members, "finished": dict(finished), "missing_from_archive": missing,
-               "elapsed_s": round(time.time() - started), "half_mm": half_mm,
+               "elapsed_s": round(time.time() - started), "half_mm": half_mm, "box_rule": rule,
+               "label_tails": {"empty": tails["empty"], "nonempty": tails["nonempty"]},
                "completed_utc": datetime.now(timezone.utc).isoformat()}
     if reader.get("raw") is not None:
         summary.update(archive_bytes_read=reader["raw"].position, reconnects=reader["raw"].reconnects)
@@ -838,6 +902,15 @@ def stream_generator(generator, samples, real_meta, store_root, work_root, *, so
 def build_manifest(store_root, selection, meta):
     """One JSON manifest of authentic volumes, manipulated volumes and authentic sites."""
     store_root = Path(store_root)
+    current = store_root / "manifest.json"
+    if current.exists():  # keep every earlier manifest; the reports refer to its checksum
+        kept = store_root / "manifest_history" / f"manifest_{sha256_path(current)[:12]}.json"
+        if not kept.exists():
+            kept.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(current, kept)
+            if sha256_path(kept) != sha256_path(current):
+                raise OSError("Earlier manifest was not preserved; the new one was not written")
+    rules = set()
     series, volumes, sites, excluded = {}, [], [], []
     for item in selection["series"]:
         receipt = store_root / "real" / (item["series_key"] + ".json")
@@ -850,19 +923,22 @@ def build_manifest(store_root, selection, meta):
                         "patient_id": item["patient_id"], "split": item["split"], "generator": "", "operation": "",
                         "label": "AUTHENTIC", "eligible": True})
     for sample in selection["samples"]:
-        receipt = store_root / "boxes" / sample["variant"] / (sample["img_id"] + ".json")
+        receipt = store_root / BOX_FOLDER / sample["variant"] / (sample["img_id"] + ".json")
         if sample["series_key"] not in series or not receipt.exists():
             excluded.append({"volume_id": f"{sample['variant']}:{sample['img_id']}",
                              "reason": "real series or manipulated box not acquired"})
             continue
         box = json.loads(receipt.read_text(encoding="utf-8"))
+        rules.add(box.get("box_rule", ""))
         volumes.append({"volume_id": f"{sample['variant']}:{sample['img_id']}", "kind": "manipulated",
                         "series_key": sample["series_key"], "patient_id": sample["patient_id"], "split": sample["split"],
                         "generator": sample["variant"], "operation": sample["operation"],
                         "label": FORENSIC_LABEL[sample["op_code"]], "img_id": sample["img_id"],
-                        "center_zyx": sample["center_zyx"], "box_file": f"boxes/{sample['variant']}/{sample['img_id']}.npz",
+                        "center_zyx": sample["center_zyx"], "box_file": f"{BOX_FOLDER}/{sample['variant']}/{sample['img_id']}.npz",
                         "box_file_sha256": box["file_sha256"], "box_start_zyx": box["box_start_zyx"],
                         "box_stop_zyx": box["box_stop_zyx"], "mask_bbox": box["mask_bbox"], "mask_voxels": box["mask_voxels"],
+                        "diff_bbox": box["diff_bbox"], "label_tail_slices": box["label_tail_slices"],
+                        "label_tail_voxels": box["label_tail_voxels"],
                         "eligible": box["eligible"], "problems": box["problems"]})
     for site in selection["sites"]:
         if site["series_key"] in series:
@@ -881,7 +957,7 @@ def build_manifest(store_root, selection, meta):
     if overlap:
         raise ValueError("A patient appears in more than one partition: " + ", ".join(sorted(overlap)[:5]))
     document = {"schema_version": "m3dsynth_store_v1", "dataset": "M3Dsynth (Zingarini et al., ICASSP 2024)",
-                "metadata_sha256": meta["sha256"], "selection": {k: selection[k] for k in
+                "box_rules": sorted(rules), "metadata_sha256": meta["sha256"], "selection": {k: selection[k] for k in
                 ("patients_per_split", "generators", "seed", "counts")},
                 "series": series, "volumes": volumes, "sites": sites, "excluded": excluded,
                 "assignments_sha256": digest_json(assignments), "patient_overlap_across_splits": sorted(overlap),

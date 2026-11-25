@@ -41,6 +41,11 @@ patient-disjoint partitions are used: train 488 / validation 100 / test 150 pati
    161 GB) are streamed once; they are not seekable, so the full archive is
    transferred even for a subset. For each selected sample only a box of
    ±48 mm around the author manipulation centre and the author voxel mask are kept.
+   Every axis also covers 24 mm of in-plane pixels: in 26 receipts of the first run the
+   changed voxels filled a cube of about 41 mm in plane with as many voxels along z, which
+   on 1.8–3 mm slices is 99–228 mm deep. Label slices numbered past the scan depth are
+   never read by the authors' loader; their content is counted, an empty one is accepted
+   and recorded, and one holding mask voxels makes the sample ineligible.
    After a network error the download reconnects with an HTTP Range request at
    the byte where it stopped, but only if the server resumes the same file (same
    size and ETag/Last-Modified); otherwise it stops rather than splice data. A

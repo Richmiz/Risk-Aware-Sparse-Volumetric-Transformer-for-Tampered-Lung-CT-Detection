@@ -19,6 +19,7 @@ patients_train = 200
 patients_validation = 100     # all publisher validation patients (more authentic scans for low-FPR thresholds)
 patients_test = 0
 half_box_mm = 48.0        # stored box half-extent around each author manipulation centre
+cube_half_mm = 24.0       # also cover this many mm of in-plane pixels on every axis (edits are voxel cubes)
 seed = 13
 
 [model]

@@ -121,7 +121,7 @@ class M3DNotebookSession:
             message = prefix + " " + json.dumps(event, default=str)
             if self.display_enabled and "status" in self._handles:
                 from IPython.display import HTML
-                self._handles["status"].update(HTML("<p><b>" + escape(message[:300]) + "</b></p>"))
+                self._handles["status"].update(HTML("<p><b>" + escape(message[:500]) + "</b></p>"))
             elif self.display_enabled:
                 print(message, flush=True)
         return report
@@ -168,18 +168,25 @@ class M3DNotebookSession:
         manifest = json.loads(path.read_text(encoding="utf-8"))
         stored = manifest.get("selection", {})
         same = all(stored.get(key) == self.selection[key] for key in ("counts", "generators", "seed"))
+        rule_matches = manifest.get("box_rules") == [self.box_rule()]
         # Samples absent from an author archive stay excluded for good; only missing LIDC series are worth fetching again.
         missing = sorted(e["series_key"] for e in manifest.get("excluded", []) if "volume_id" not in e)
-        reason = ("complete" if same and not missing else
-                  "the selection changed (patients, generators or seed)" if not same else
-                  f"{len(missing)} LIDC series not acquired yet")
-        return {"exists": True, "complete": same and not missing, "reason": reason, "missing_series": missing}
+        reason = ("the selection changed (patients, generators or seed)" if not same else
+                  "the edit boxes were made under an earlier rule, so the archives must be streamed again"
+                  if not rule_matches else
+                  f"{len(missing)} LIDC series not acquired yet" if missing else "complete")
+        return {"exists": True, "complete": same and rule_matches and not missing, "reason": reason, "missing_series": missing}
+
+    def box_rule(self):
+        acquisition = self.config["acquisition"]
+        return store_mod.box_rule(acquisition["half_box_mm"], acquisition.get("cube_half_mm", 0.))
 
     def check_storage(self, *, stop=True, margin_gb=2.):
         """Compare free Drive and runtime-disk space with what the download still needs."""
         estimate = store_mod.storage_estimate(self.selection)
-        used = (sum(p.stat().st_size for p in self.store_root.rglob("*") if p.is_file()) / 1e9
-                if self.store_root.exists() else 0.)
+        # Boxes kept from an earlier rule do not reduce what this rule still has to store.
+        used = sum(p.stat().st_size for folder in ("real", "coarse", store_mod.BOX_FOLDER)
+                   for p in (self.store_root / folder).rglob("*") if p.is_file()) / 1e9
         needs = {"Google Drive": (self.project, max(0., estimate["estimated_drive_gb"] - used) + margin_gb),
                  # uncompressed series (~80 MB each) stay on the runtime disk while the archives stream
                  "runtime disk": (self.cache_root, estimate["real_series"] * .08 + margin_gb)}
@@ -240,7 +247,8 @@ class M3DNotebookSession:
             source = (archive_sources or {}).get(generator)
             streams[generator] = store_mod.stream_generator(
                 generator, available, real_meta, self.store_root, self.work_root, source=source,
-                extracted_root=extracted_root, half_mm=self.config["acquisition"]["half_box_mm"], progress=report)
+                extracted_root=extracted_root, half_mm=self.config["acquisition"]["half_box_mm"],
+                cube_half_mm=self.config["acquisition"].get("cube_half_mm", 0.), progress=report)
         manifest = store_mod.build_manifest(self.store_root, self.selection, self.meta)
         self._save_json("acquisition_report.json", {"real_series_ok": len(real_meta), "real_series_failed": failures,
                                                     "streams": streams, "manifest_counts": manifest["counts"]})
