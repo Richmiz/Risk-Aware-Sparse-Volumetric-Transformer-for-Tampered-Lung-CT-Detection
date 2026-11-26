@@ -33,13 +33,18 @@ STORE_RELATIVE = "datasets/m3dsynth_store"
 RUNS_RELATIVE = "outputs/rsvt_training"
 METADATA_RELATIVE = "data/raw/m3dsynth/metadata"
 UID_MAP_RELATIVE = "reports/supplementary/data_label_audit_20261111/metadata_review_v2/m3dsynth_source_groups.csv"
+# What a GPU runtime does: train the model, or only check that its crop network can learn the edit.
+RUNS = ("train", "crop_check")
 
 
 class M3DNotebookSession:
     def __init__(self, project, code_root, *, epochs=30, learning_rate=2e-4, patience=8, seed=13,
                  patients_train=200, patients_validation=100, generators=("cycle", "pix2pix", "diffusion"),
                  resume_session="", configuration=None, store_root=None, cache_root=None, work_root=None,
-                 lidc_root=None, metadata_dir=None, enforce_drive=True, display_enabled=True, code_commit=None):
+                 lidc_root=None, metadata_dir=None, enforce_drive=True, display_enabled=True, code_commit=None, run="train"):
+        if run not in RUNS:
+            raise ValueError("RUN must be one of: " + ", ".join(f'"{r}"' for r in RUNS))
+        self.run = run
         self.project, self.code_root = Path(project).resolve(), Path(code_root).resolve()
         if enforce_drive and (platform.system() != "Linux"
                               or not self.project.is_relative_to(Path("/content/drive/MyDrive").resolve())):
@@ -78,7 +83,7 @@ class M3DNotebookSession:
         write_profile(self.root / "training_config.toml", self.config)
         self.artifacts, self._handles, self._history = {}, {}, []
         self._save_json("notebook_session.json", {"binding": binding, "store": str(self.store_root),
-                                                  "code_commit": code_commit,
+                                                  "code_commit": code_commit, "run": run,
                                                   "created_utc": datetime.now(timezone.utc).isoformat(),
                                                   "test_status": "not_acquired_reserved_for_final_evaluation"})
         if metadata_dir is None:
@@ -513,8 +518,86 @@ class M3DNotebookSession:
             message = json.dumps(event, default=str)[:200]
         self._handles["status"].update(HTML("<p><b>" + escape(message) + "</b></p>"))
 
+    # ------------------------------------------------------------------ crop learning check
+    def run_crop_check(self, *, device=None, **settings):
+        """With RUN = "crop_check": train the fine crop network alone on crops that contain the edit."""
+        if self.run != "crop_check":
+            self._html('<p>Crop learning check skipped (RUN = "train").</p>')
+            return None
+        device = device or ("cuda" if torch.cuda.is_available() else None)
+        if device is None:
+            self._html("<p><b>No GPU in this runtime, so the crop learning check waits.</b> Switch to a GPU runtime "
+                       "(Runtime → Change runtime type → L4) and Run all.</p>")
+            return None
+        from rsvt.experiments import m3d_crop_check
+        if self.display_enabled:
+            from IPython.display import HTML, display
+            self._handles["status"] = display(HTML("<p>Cutting crop pairs…</p>"), display_id=True)
+        model = self.config["model"]
+        result = m3d_crop_check.crop_check(
+            self._store(), self.config["data"]["generators"], self.root / "crop_check", device=device,
+            seed=self.config["training"]["seed"], progress=self._progress_printer("[crop check]"),
+            model_kwargs={"dimension": model["dimension"], "widths": tuple(model["fine_widths"])}, **settings)
+        self.artifacts["crop_check/crop_check.json"] = {"sha256": sha256_path(self.root / "crop_check/crop_check.json")}
+        self.show_crop_check(result)
+        return result
+
+    def show_crop_check(self, result):
+        import matplotlib.pyplot as plt
+        number = lambda v, p=False: "—" if v is None else (f"{100 * v:.0f}%" if p else f"{v:.3f}")
+        accuracy = lambda metrics, group: (metrics.get(group) or {}).get("paired_accuracy")
+        arms = result["arms"]
+        fit = arms["fit"]["final"]["train"]["all"]
+        rows = [("Pairs: train / validation (patients)",
+                 f"{sum(result['pairs']['train'].values())} / {sum(result['pairs']['validation'].values())} "
+                 f"({result['pairs']['train_patients']} / {result['pairs']['validation_patients']})"),
+                ("Edit still visible after the HU window (median, removal / insertion)",
+                 " / ".join(number(result["edit_in_crop"]["visible_after_window_median"][op], True)
+                            for op in ("removal", "insertion"))),
+                (f"Fit {arms['fit']['pairs']} training pairs: BCE / pairs ordered correctly",
+                 f"{number(fit['bce'])} / {number(fit['paired_accuracy'], True)}")]
+        for kind, label in (("image", "Windowed image (as the model sees it)"), ("residual", "Residual (image minus local mean)")):
+            final = arms[kind]["final"]
+            validation, seen = final["validation"], final["train_sample"]
+            rows.append((f"{label}: unseen patients, pairs ordered correctly (removal / insertion)",
+                         f"{number(accuracy(validation, 'removal'), True)} / "
+                         f"{number(accuracy(validation, 'insertion'), True)} — {result['verdicts'][kind].replace('_', ' ')}"))
+            rows.append((f"{label}: crop AUROC unseen / training pairs",
+                         f"{number(validation['all']['crop_auroc'])} / {number(seen['all']['crop_auroc'])}"))
+        rows.append(("Conclusion", result["interpretation"]))
+        self._html("<h3>Crop learning check (train/validation only)</h3>" + table_html(["Check", "Result"], rows)
+                   + "<p>50% = chance. Each pair is a manipulated crop and the same crop of its real scan; the check "
+                     "removes crop selection, so it shows the most the crop stage can do.</p>")
+        figure, axes = plt.subplots(1, 3, figsize=(14, 3.6))
+        for kind in ("fit", "image", "residual"):
+            curve = arms[kind]["curve"][1:]
+            axes[0].plot([p["step"] for p in curve], [p["train_loss"] for p in curve], marker="o", label=kind)
+        axes[0].axhline(np.log(2), color="grey", linestyle=":", label="chance")
+        for axis, kind in zip(axes[1:], ("image", "residual")):
+            curve = arms[kind]["curve"]
+            for op in ("removal", "insertion"):
+                axis.plot([p["step"] for p in curve], [np.nan if accuracy(p["validation"], op) is None
+                                                       else accuracy(p["validation"], op) for p in curve],
+                          marker="o", label=f"{op}, unseen patients")
+            axis.plot([p["step"] for p in curve], [p["train_sample"]["all"]["paired_accuracy"] for p in curve],
+                      linestyle="--", label="training pairs")
+            axis.axhline(.5, color="grey", linestyle=":")
+            axis.set(title=f"{kind}: pairs ordered correctly", xlabel="Step", ylim=(0, 1))
+        axes[0].set(title="Training loss (BCE)", xlabel="Step")
+        for axis in axes:
+            axis.grid(alpha=.2)
+            axis.legend(fontsize=8)
+        figure.tight_layout()
+        self._figure(figure, "crop_check.png")
+        plt.close(figure)
+        return rows
+
     def train_when_ready(self, diagnostics=None):
         """Train (or resume) on a GPU unless a data check blocks it; on a CPU runtime explain the next step."""
+        if self.run != "train":
+            self._html('<p><b>No training in this run</b> (RUN = "crop_check"). Set RUN = "train" in section 1 to '
+                       "train the model.</p>")
+            return None
         if self.config["training"]["device"] == "cuda" and not torch.cuda.is_available():
             self._html("<p><b>No GPU in this runtime, so training waits.</b> The dataset and its checks are saved. "
                        "Switch to a GPU runtime (Runtime → Change runtime type → L4) and Run all; training starts, "
@@ -608,6 +691,9 @@ class M3DNotebookSession:
             text += f"Validation tamper AUROC {m['tamper_auroc']}; removal AUROC {m['removal_auroc']}; worst generator {m['worst_generator_auroc']}.\n\n"
         else:
             text += "Training has not completed yet.\n\n"
+        check = self.root / "crop_check" / "crop_check.json"
+        if check.exists():
+            text += "Crop learning check: " + json.loads(check.read_text(encoding="utf-8"))["interpretation"] + "\n\n"
         text += "Test volumes acquired/opened: 0.\n"
         (self.root / "run_overview.md").write_text(text, encoding="utf-8")
         if (self.root / "run_overview.md").read_text(encoding="utf-8") != text:

@@ -3,6 +3,7 @@
 Procedural CT series and TIFF archives only; no medical images are read.
 """
 
+from collections import Counter
 import csv
 import errno
 import hashlib
@@ -831,6 +832,144 @@ class DiagnosticsAndNotebook(unittest.TestCase):
         self.assertIn("training/summary.json", records)
         self.assertIn("figures/learning_curves.png", records)
         self.assertTrue(session.train()["training_finished"])  # re-run reuses the finished session
+
+
+class CropCheck(unittest.TestCase):
+    """The crop learning check: paired crops at known edits, three arms, train/validation only."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = TemporaryDirectory(ignore_cleanup_errors=True)
+        cls.fx = Fixture(cls.tmp.name)
+        cls.fx.acquire()
+        cls.store = M3DStore(cls.fx.store, Path(cls.tmp.name) / "cache")
+
+    @classmethod
+    def tearDownClass(cls):
+        import gc
+        gc.collect()
+        cls.tmp.cleanup()
+
+    def tiny(self, **changes):
+        settings = dict(device="cpu", per_operation_train=0, per_operation_validation=0, fit_per_operation=2, steps=4,
+                        fit_steps=4, batch_pairs=2, shape=(8, 16, 16), margin=(2, 4, 4), eval_every=2)
+        settings.update(changes)
+        return settings
+
+    def test_pairs_are_balanced_spread_over_generators_and_prefix_stable(self):
+        from rsvt.experiments.m3d_crop_check import select_pairs
+        everything = select_pairs(self.store, "train", GENS, 0, 13)
+        self.assertEqual(Counter(v["operation"] for v in everything), {"removal": 4, "insertion": 4})
+        self.assertEqual({v["split"] for v in everything}, {"train"})
+        two = select_pairs(self.store, "train", GENS, 2, 13)
+        by_operation = lambda volumes, op: [v["volume_id"] for v in volumes if v["operation"] == op]
+        for operation in ("removal", "insertion"):
+            self.assertEqual(by_operation(two, operation), by_operation(everything, operation)[:2])  # prefix
+            self.assertEqual({v["generator"] for v in two if v["operation"] == operation}, set(GENS))  # round-robin
+
+    def test_pairs_differ_only_in_the_changed_voxels(self):
+        from rsvt.experiments.m3d_crop_check import extract_pairs, select_pairs
+        volumes = select_pairs(self.store, "validation", GENS, 0, 13)
+        shape, margin = (8, 16, 16), (2, 4, 4)
+        data = extract_pairs(self.store, volumes, shape, margin)
+        self.assertEqual(tuple(data["fake"].shape), (4, 1, 12, 24, 24))
+        core = tuple(slice(m, m + s) for s, m in zip(shape, margin))
+        for volume, record in zip(volumes, data["records"]):
+            image, _, edit = self.store.crop(volume, np.asarray(volume["center_zyx"], float), (12, 24, 24))
+            reference, _, _ = self.store.crop({"kind": "authentic", "series_key": volume["series_key"]},
+                                              np.asarray(volume["center_zyx"], float), (12, 24, 24))
+            self.assertEqual(record["changed_voxels_in_crop"], int(edit[core].sum()))
+            self.assertGreater(record["changed_voxels_in_crop"], 0)
+            self.assertAlmostEqual(record["edit_visible_after_window"],
+                                   ((image != reference) & edit)[core].sum() / edit[core].sum())
+        original = self.store.crop
+
+        def shifted(volume, center, shape):  # a real crop that is not the same location
+            image, inside, edit = original(volume, center, shape)
+            return (image + .01 if volume["kind"] == "authentic" else image), inside, edit
+        with mock.patch.object(self.store, "crop", shifted):
+            with self.assertRaisesRegex(ValueError, "differs outside its changed voxels"):
+                extract_pairs(self.store, volumes[:1], shape, margin)
+
+    def test_metrics_verdicts_and_conclusions(self):
+        from rsvt.experiments.m3d_crop_check import interpret, pair_metrics, verdict
+        records = [{"operation": op, "generator": "cycle"} for op in ("removal", "removal", "insertion", "insertion")]
+        fake, real = np.array([2., 0., 1., 1.]), np.array([1., 1., 0., 1.])
+        metrics = pair_metrics(fake, real, records)
+        self.assertEqual(metrics["removal"]["paired_accuracy"], .5)   # one above its real crop, one below
+        self.assertEqual(metrics["insertion"]["paired_accuracy"], .75)  # one above, one tie
+        self.assertAlmostEqual(metrics["all"]["bce"], (np.logaddexp(0, -fake).sum() + np.logaddexp(0, real).sum()) / 8)
+        self.assertEqual(metrics["cycle:removal"]["pairs"], 2)
+        case = lambda overall, removal, insertion: {"all": {"paired_accuracy": overall}, "removal": {"paired_accuracy": removal},
+                                                    "insertion": {"paired_accuracy": insertion}}
+        self.assertEqual([verdict(case(.9, .85, .95)), verdict(case(.5, .1, .9)), verdict(case(.65, .6, .7)),
+                          verdict(case(.5, .5, .5)), verdict({"all": {"paired_accuracy": .5}, "removal": None})],
+                         ["learned", "nodule_presence", "partly", "not_learned", "incomplete"])
+        fits, fails = {"bce": .01, "paired_accuracy": 1.}, {"bce": .6, "paired_accuracy": .7}
+        self.assertIn("could not fit", interpret(fails, {"image": "learned", "residual": "learned"}))
+        self.assertIn("lies upstream", interpret(fits, {"image": "learned", "residual": "not_learned"}))
+        self.assertIn("residual input", interpret(fits, {"image": "not_learned", "residual": "learned"}))
+        text = interpret(fits, {"image": "nodule_presence", "residual": "partly"})
+        self.assertIn("partly on residual", text)
+        self.assertIn("On image it scores one operation well and the other badly", text)
+
+    def test_residual_removes_flat_anatomy_and_keeps_a_one_voxel_trace(self):
+        from rsvt.experiments.m3d_crop_check import residual
+        flat = torch.full((1, 1, 6, 6, 6), .4)
+        self.assertLess(float(residual(flat).abs().max()), 1e-6)
+        spike = flat.clone()
+        spike[0, 0, 3, 3, 3] = 1.
+        self.assertAlmostEqual(float(residual(spike)[0, 0, 3, 3, 3]), .6 * 26 / 27, places=5)
+
+    def test_crop_check_runs_every_arm_on_train_and_validation_only(self):
+        from rsvt.experiments.m3d_crop_check import crop_check
+        out = Path(self.tmp.name) / "crop_check"
+        events = []
+        result = crop_check(self.store, GENS, out, model_kwargs={"dimension": 8, "widths": (4, 8, 8)},
+                            progress=events.append, **self.tiny())
+        saved = json.loads((out / "crop_check.json").read_text(encoding="utf-8"))
+        self.assertEqual((saved["schema_version"], saved["interpretation"]), (result["schema_version"], result["interpretation"]))
+        self.assertEqual((sum(result["pairs"]["train"].values()), sum(result["pairs"]["validation"].values()),
+                          result["pairs"]["fit"]), (8, 4, 4))
+        self.assertEqual((result["pairs"]["train_patients"], result["pairs"]["validation_patients"]), (2, 1))
+        validation_ids = {v["volume_id"] for v in self.store.manifest["volumes"] if v["split"] == "validation"}
+        self.assertTrue({r["volume_id"] for r in result["records"]["validation"]} <= validation_ids)
+        self.assertEqual(set(result["arms"]), {"fit", "image", "residual"})
+        for name, arm in result["arms"].items():
+            # the fit arm reports six times over its steps; the others every `eval_every` steps
+            self.assertEqual([p["step"] for p in arm["curve"]], [0, 1, 2, 3, 4] if name == "fit" else [0, 2, 4])
+            self.assertEqual(set(arm["final"]) - {"step", "train_loss", "learning_rate"},
+                             {"train"} if name == "fit" else {"validation", "train_sample"})
+        self.assertEqual(set(result["verdicts"]), {"image", "residual"})
+        self.assertEqual(result["test_volumes_opened"], 0)
+        self.assertEqual({e.get("arm") for e in events if e["stage"] == "crop_check"}, {"fit", "image", "residual"})
+
+    def test_notebook_runs_the_check_instead_of_training(self):
+        from rsvt.training.m3d_notebook import M3DNotebookSession
+        root = Path(self.tmp.name)
+        (root / "check_project/outputs/rsvt_training").mkdir(parents=True)
+        common = dict(configuration=small_config(), epochs=2, learning_rate=1e-3, patience=0, seed=13,
+                      patients_train=2, patients_validation=1, generators=GENS, metadata_dir=self.fx.meta_dir,
+                      lidc_root=self.fx.lidc, enforce_drive=False, display_enabled=False,
+                      store_root=self.fx.store, cache_root=root / "check_cache")
+        with self.assertRaisesRegex(ValueError, "RUN must be one of"):
+            M3DNotebookSession(root / "check_project", REPO, run="both", **common)
+        training = M3DNotebookSession(root / "check_project", REPO, **common)
+        self.assertIsNone(training.run_crop_check())  # RUN = "train": skipped
+        session = M3DNotebookSession(root / "check_project", REPO, run="crop_check", **common)
+        with mock.patch.object(trainer, "run_training", side_effect=AssertionError("trained")):
+            self.assertIsNone(session.train_when_ready())
+        with mock.patch.object(torch.cuda, "is_available", return_value=False):
+            self.assertIsNone(session.run_crop_check())  # waits for a GPU
+        settings = self.tiny()
+        result = session.run_crop_check(**settings)
+        self.assertEqual(result["settings"]["model"], {"dimension": 16, "widths": [4, 8, 8]})  # the model's fine branch
+        records = session.verify_saved()
+        self.assertIn("crop_check/crop_check.json", records)
+        self.assertIn("figures/crop_check.png", records)
+        self.assertIn("Crop learning check: " + result["interpretation"],
+                      (session.root / "run_overview.md").read_text(encoding="utf-8"))
+        self.assertEqual(json.loads((session.root / "notebook_session.json").read_text(encoding="utf-8"))["run"], "crop_check")
 
 
 class BoxRuleAndLabelTail(unittest.TestCase):

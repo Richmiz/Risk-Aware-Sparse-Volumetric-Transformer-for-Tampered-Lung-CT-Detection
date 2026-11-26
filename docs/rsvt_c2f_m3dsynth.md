@@ -4,8 +4,8 @@ Updated 26 November 2026. This document describes the model and data path used
 by `notebooks/01_RSVT_TRAINING.ipynb`. It replaces the 96³-token RSVT as the
 proposed model; that design remains available as a negative control
 (`configs/training/rsvt_real_ct.toml`, see [rsvt_theory.md](rsvt_theory.md)).
-Nothing here is a model result: the store was built on 25–26 Nov 2026, and no model
-has been trained on it yet.
+The store was built on 25–26 Nov 2026. One model has been trained on it, and it did
+not learn to detect tampering (see [First training run](#first-training-run-26-november-2026)).
 
 ## Why the design changed
 
@@ -139,10 +139,69 @@ accuracy, router recall@K and mask Dice on crops containing the site.
 * **Shortcut check**: archive identity outside boxes, whether edits extend beyond
   the author mask box, and a whole-scan histogram classifier (expected ≈0.5).
 
+On the store of 26 Nov the resolution check gave native-crop AUROC 0.615 (removal
+0.448, insertion 0.662) and 0.633 for the degraded crops: the small CNN barely
+separated manipulated crops from matched authentic sites at either resolution.
+
+## First training run (26 November 2026)
+
+L4 GPU, commit `a732b1f`, default settings: 200 authentic and 2,024 manipulated
+training volumes; 103 authentic and 1,469 manipulated validation volumes (309
+removals, 1,160 insertions). Early stopping ended it after epoch 12 (1 h 45 min);
+the selected checkpoint is epoch 4. No test volume was opened.
+
+| Measure | Epoch 1 | Epoch 4 (selected) | Epoch 12 (last) |
+|---|---|---|---|
+| Validation tamper AUROC | 0.572 | 0.427 | 0.530 |
+| Validation removal AUROC | 0.616 | 0.524 | 0.623 |
+| Validation worst-generator AUROC | 0.551 | 0.380 | 0.526 |
+| Router recall@16 | 8% | 38% | 37% |
+| Training volume tamper loss (chance 0.693) | 0.698 | 0.706 | 0.698 |
+| Training visible-nodule loss | 0.684 | 0.680 | 0.576 |
+
+* The volume tamper, removal and crop tamper losses stayed at chance on the
+  training volumes for all 600 optimizer steps. The edit-mask head predicted no
+  voxel (Dice ≈ 0). Only the router (loss 2.85 → 0.60) and, from epoch 10, the
+  visible-nodule head learned; both describe anatomy, not the edit.
+* The selected model gives every validation scan about the same score (≈0.58–0.60),
+  so its AUROCs below 0.5 are noise around a constant, not an inverted signal.
+* The selection score (validation BCE averaged over authentic, removal and insertion)
+  is 0.637 for the best constant prediction. Epoch 4 won by being a better constant,
+  and early stopping counted from it. This rule must change before the next training run.
+* `label_check.json`: removals change 96% of the author mask box (median; 91% at the
+  10th percentile) and reach 3.8× its depth, changing every slice in between;
+  insertions stay inside their mask box.
+
+## Crop learning check
+
+`src/rsvt/experiments/m3d_crop_check.py` asks whether the model's fine crop network,
+alone and with fresh weights, can learn the edit when every crop contains it. Each
+pair is a manipulated crop at the author manipulation centre and the same crop of its
+real series; the two are checked to differ only in the changed voxels. Removals and
+insertions are balanced, so nodule presence cannot separate the classes (the real
+crop of a removal holds a nodule, that of an insertion does not); per-operation
+results expose that shortcut. Crops are 24×64×64 voxels, cut with a 4/8/8-voxel
+margin for shifts. Three arms:
+
+* **fit**: 32 training pairs, no augmentation, 600 steps: can it fit them at all?
+* **image**: up to 384 training pairs (192 per operation; shift and flip shared by
+  both crops of a pair), 2,000 steps, tested on up to 192 pairs from unseen
+  validation patients, on the windowed image the model sees.
+* **residual**: the same on the image minus its 3×3×3 local mean, which suppresses
+  anatomy and keeps fine texture and seams.
+
+It reports pairs ordered correctly (manipulated above its own real crop) per
+operation and generator, crop AUROC, how much of the edit the HU window still shows,
+and a one-line conclusion. Its thresholds (≥80% for both operations = learned)
+describe the result; they are not pre-registered endpoints. It removes crop
+selection, so it bounds what the crop stage can do and says nothing about routing.
+
 ## Running it
 
-Open `notebooks/01_RSVT_TRAINING.ipynb` in Colab from GitHub and use Run all;
-there are no stage switches. Section 3 continues the latest unfinished training
+Open `notebooks/01_RSVT_TRAINING.ipynb` in Colab from GitHub and use Run all. On a
+GPU, `RUN` chooses what the run does: `"crop_check"` (the current default) runs the
+crop learning check in section 12 and does not train; `"train"` trains in section 13.
+With `RUN = "train"`, section 3 continues the latest unfinished training
 run when there is one (`RESUME_SESSION = "auto"`), checking out the commit that
 run started with; otherwise it clones the public repository at `CODE_REF`. Section
 4 fetches the M3Dsynth metadata tables at a pinned commit of the authors'
@@ -155,10 +214,10 @@ selection, after checking free space in Google Drive and on the runtime disk;
 otherwise it reads the store back against its checksums. Section 9 runs the data
 checks once per store (saved beside it) and holds training back if most samples
 failed archive verification or whole-scan statistics separate the classes.
-Section 12 trains only on a GPU; on a CPU runtime it stops with a message, so the
-cheap first run prepares and checks the data and a later GPU run trains. Section 17
-releases the Colab runtime (`google.colab.runtime.unassign`) after section 16 has
-read every saved file back; if an earlier cell fails, the runtime is kept.
+Sections 12 and 13 run only on a GPU; on a CPU runtime they stop with a message, so
+the cheap first run prepares and checks the data and a later GPU run does the rest.
+Section 18 releases the Colab runtime (`google.colab.runtime.unassign`) after
+section 17 has read every saved file back; if an earlier cell fails, the runtime is kept.
 
 ## Limits
 

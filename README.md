@@ -58,8 +58,8 @@ The study trains and validates on M3Dsynth, which edits LIDC-IDRI scans with thr
 [Open `notebooks/01_RSVT_TRAINING.ipynb` in Colab](https://colab.research.google.com/github/Richmiz/Risk-Aware-Sparse-Volumetric-Transformer-for-Tampered-Lung-CT-Detection/blob/main/notebooks/01_RSVT_TRAINING.ipynb) and use Run all; the defaults are ready. The notebook decides each stage from what is already saved in Google Drive:
 
 1. On a CPU runtime it checks free space, downloads and verifies the selected M3Dsynth samples and their LIDC-IDRI source series, runs the resolution and shortcut checks, and stops before training.
-2. On a GPU runtime (an L4 is the best value) it reads the saved dataset back against its checksums, reuses the checks, and trains.
-3. After a disconnect, Run all again continues the unfinished training run with the code commit it started with.
+2. On a GPU runtime (an L4 is the best value) it reads the saved dataset back against its checksums, reuses the checks, and then does what `RUN` says. The current default, `RUN = "crop_check"`, checks whether the model's crop network can learn the edit from crops that contain it, and does not train. `RUN = "train"` trains the model.
+3. After a disconnect, Run all again (with `RUN = "train"`) continues the unfinished training run with the code commit it started with.
 
 When a run finishes and every saved file has been read back from Drive, the last cell releases the Colab runtime so it stops using compute units (`SHUTDOWN_WHEN_DONE`).
 

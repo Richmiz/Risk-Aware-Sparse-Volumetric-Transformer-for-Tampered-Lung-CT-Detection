@@ -7,6 +7,9 @@ frozen backend, so it rebuilds byte-identically.
 24 Nov 2026: the user runs 01_RSVT_TRAINING online in Colab, opened from GitHub.
 It clones the project code from GitHub at `CODE_REF` and saves the exact commit
 with the session, instead of loading a code release copied to Drive.
+
+26 Nov 2026: `RUN` chooses between the crop learning check (section 12) and training,
+after the first training run stayed at chance.
 """
 
 from copy import deepcopy
@@ -32,10 +35,11 @@ CODE_CELL = (
     'CODE_ROOT = Path("/content/rsvt-code")\n'
     'env = dict(os.environ, GIT_TERMINAL_PROMPT="0")\n'
     '\n'
-    '# A resumed run keeps the code commit it started with.\n'
+    '# A resumed run keeps the code commit it started with. Only training runs are continued.\n'
     'RESUME_FOLDER, ref = "", CODE_REF\n'
     'if RESUME_SESSION == "auto":\n'
-    '    for record in sorted(Path(PROJECT, "outputs/rsvt_training").glob("c2f_*/notebook_session.json"), reverse=True):\n'
+    '    runs = Path(PROJECT, "outputs/rsvt_training").glob("c2f_*/notebook_session.json") if RUN == "train" else []\n'
+    '    for record in sorted(runs, reverse=True):\n'
     '        run = record.parent\n'
     '        if (run / "training/last.pt").exists() and not (run / "training/summary.json").exists():\n'
     '            RESUME_FOLDER = str(run)\n'
@@ -101,7 +105,8 @@ def training_notebook():
         '1. **First, on a CPU runtime** (cheapest): it downloads and verifies the dataset, runs the data checks and stops '
         'before training. This takes hours; keep the tab open.\n'
         '2. **Then on a GPU runtime** (Runtime → Change runtime type → L4): it reads the saved dataset back, reuses the '
-        'checks and trains.\n'
+        'checks and then does what `RUN` says. The current default, `RUN = "crop_check"`, checks that the crop network can '
+        'learn the edit (about 30 minutes) and does not train; `RUN = "train"` trains the model.\n'
         '3. **After a disconnect**, Run all again: it continues the unfinished training run with the code it started with.\n\n'
         'When a run finishes and every saved file has been read back from Drive, the last cell releases the runtime so it '
         'stops using compute units; the outputs stay visible.\n\n'
@@ -116,13 +121,15 @@ def training_notebook():
         'Test patients are not downloaded or opened here.\n', 'introduction')]
     sections=[
         ('settings','1. Choose the run settings',
-         'Why: everything you might change is here, and the defaults are ready to run. There are no stage switches: the '
-         'notebook prepares data, checks it and trains according to what is saved and whether a GPU is present. '
+         'Why: everything you might change is here, and the defaults are ready to run. The notebook prepares data and '
+         'checks it according to what is saved and whether a GPU is present; on a GPU, `RUN` chooses between the crop '
+         'learning check (section 12, no training) and training (section 13). With `RUN = "train"`, '
          '`RESUME_SESSION = "auto"` continues the latest unfinished training run; changing any setting below needs a new '
          'run, so then set `RESUME_SESSION = ""`. `CODE_REF` chooses the code for a new run (a branch, tag or commit). '
          '`LIDC_ROOT` may point to an existing LIDC-IDRI download in Drive (NBIA folder layout).',
          'PROJECT = "/content/drive/MyDrive/Research/LUNG-CT-SCAN"\n'
          f'REPOSITORY = "{REPOSITORY}"\n'
+         'RUN = "crop_check"         # "crop_check" = can the crop network learn the edit? (no training); "train" = train\n'
          'CODE_REF = "main"          # code for a new run; a resumed run keeps the commit it started with\n'
          'RESUME_SESSION = "auto"    # "auto" = continue the latest unfinished run; "" = new run; or a run folder\n'
          'GENERATORS = ["cycle", "pix2pix", "diffusion"]  # remove one to hold it out\n'
@@ -147,7 +154,7 @@ def training_notebook():
          'session = create_session(PROJECT, CODE_ROOT, epochs=EPOCHS, learning_rate=LEARNING_RATE,\n'
          '    patience=EARLY_STOPPING_PATIENCE, seed=SEED, patients_train=PATIENTS_TRAIN,\n'
          '    patients_validation=PATIENTS_VALIDATION, generators=tuple(GENERATORS),\n'
-         '    lidc_root=LIDC_ROOT or None, resume_session=RESUME_FOLDER, code_commit=RSVT_COMMIT)\n'
+         '    lidc_root=LIDC_ROOT or None, resume_session=RESUME_FOLDER, code_commit=RSVT_COMMIT, run=RUN)\n'
          'print("Run folder in Drive:", session.root)\n'),
         ('hardware','5. Check the actual runtime and GPU',
          'Why: a server label is not proof of a GPU. This checks what PyTorch sees. Data preparation and the data checks '
@@ -184,30 +191,39 @@ def training_notebook():
          'Why: see parameters and compute. The 96³ view gives anatomy context and a router chooses K native-resolution crops; '
          'evidence is read only there. The table compares this with running the same encoder over the whole native volume.',
          'if session.has_store():\n    parameter_count = session.show_model()\n'),
-        ('training','12. Train and watch the epoch results',
-         'Why: learn from training volumes and monitor validation volumes. On a GPU runtime this trains, or continues the '
-         'unfinished run; on a CPU runtime it stops here with a message. Expected output: batch progress, an updating epoch '
+        ('crop_check','12. Check that the crop network can learn the edit',
+         'Why: the first full training run (26 Nov 2026) left every tamper loss at chance, even on training volumes. '
+         'This trains the model\'s crop network alone, with fresh weights, on crops that always contain the edit: each pair '
+         'is a manipulated crop and the same crop of its real scan, so they differ only in the changed voxels. Removals '
+         'and insertions are balanced, so "is there a nodule here" cannot separate them. It fits 32 training pairs, then '
+         'learns from up to 384 pairs and is tested on up to 192 pairs from unseen validation patients, once on the windowed '
+         'image the model sees and once on its residual (image minus local mean). Runs only with `RUN = "crop_check"` on a '
+         'GPU, in about 30 minutes. Expected output: a table, curves and a one-line conclusion. No test data is opened.',
+         'crop_check = session.run_crop_check() if session.has_store() else None\n'),
+        ('training','13. Train and watch the epoch results',
+         'Why: learn from training volumes and monitor validation volumes. On a GPU runtime with `RUN = "train"` this '
+         'trains, or continues the unfinished run; otherwise it stops here with a message. Expected output: batch progress, an updating epoch '
          'table and learning curves. The first epochs train without tail risk; the checkpoint is chosen among risk-stage epochs '
          'by the validation loss averaged over authentic, removal and insertion volumes. Where a volume was edited is taken '
          'from its changed voxels (manipulated vs real), not the author mask, which misses most of each removal. Checkpoints '
          'and logs save to Drive after every epoch.',
          'training_summary = session.train_when_ready(diagnostics) if session.has_store() else None\n'),
-        ('curves','13. Review the learning curves',
+        ('curves','14. Review the learning curves',
          'Why: compare training objective with validation loss and AUROCs. Falling training loss alone does not prove generalization.',
          'epoch_history = session.show_history()\n'),
-        ('results','14. Inspect the selected model’s results',
+        ('results','15. Inspect the selected model’s results',
          'Why: judge detection where it matters: removal (FB) and insertion (FM) against authentic scans, per generator, '
          'router recall (did the chosen crops contain the edit?) and overlap with the changed voxels, then how those labels '
          'compare with the author mask. Operating points are exploratory.',
          'selected_model_results = session.show_results()\n'),
-        ('test','15. Understand the held-out test set',
+        ('test','16. Understand the held-out test set',
          'Why: keep an independent final check. Test patients are not acquired or opened by this notebook.',
          'session.show_test_status()\n'),
-        ('saved','16. Verify that the results are saved',
+        ('saved','17. Verify that the results are saved',
          'Why: confirm Drive storage by reading files back against checksums. Expected output: **Saved and verified** and the session path.',
          'persistence_receipt = session.verify_saved()\nprint("Run folder:", session.root)\n'),
-        ('shutdown','17. Release the runtime',
-         'Why: an idle runtime keeps using compute units until Colab disconnects it. This runs only after section 16 has '
+        ('shutdown','18. Release the runtime',
+         'Why: an idle runtime keeps using compute units until Colab disconnects it. This runs only after section 17 has '
          'read every saved file back, so nothing is lost; the outputs above stay visible. If an earlier cell failed, Run all '
          'stopped there and the runtime is kept so you can see the error. Set `SHUTDOWN_WHEN_DONE = False` to keep it.',
          'if SHUTDOWN_WHEN_DONE:\n'

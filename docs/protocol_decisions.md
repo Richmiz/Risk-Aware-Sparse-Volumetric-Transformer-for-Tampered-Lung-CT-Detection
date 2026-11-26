@@ -117,6 +117,19 @@ The second acquisition (25–26 Nov, CPU, no training) accepted 3,493 of 3,594 m
 | Site crop and visible-nodule label | Unchanged | Centred on the author mask box, which lay within a voxel of the centre of the changed voxels; removal 0, insertion 1 |
 | Label check | Added | Each training run saves `label_check.json`: share of the mask changed, share of the edit inside the mask, edit depth / mask depth and the share of slices changed within the edit, by operation and generator |
 
+## Amendment 26 November 2026 (later) — first training run and the crop learning check
+
+The first L4 training run (commit `a732b1f`) stopped after epoch 12. The volume tamper, removal and crop tamper
+losses stayed at chance on the training volumes for all 600 optimizer steps, and the selected epoch 4 gives every
+validation scan about the same score (tamper AUROC 0.427). Details in [rsvt_c2f_m3dsynth.md](rsvt_c2f_m3dsynth.md).
+
+| Decision | Status | Rule |
+|---|---|---|
+| Next GPU run | Changed | `RUN = "crop_check"` (notebook default for now): train the fine crop network alone on paired crops that always contain the edit, and do not train the full model. `RUN = "train"` trains as before |
+| Crop learning check design | Added | Manipulated crop vs the same crop of its real series (differ only in the changed voxels, checked per pair); removals and insertions balanced; arms fit (32 pairs), image and residual (up to 384 training pairs and 192 validation pairs from unseen patients); train/validation only |
+| Auto-resume | Narrowed | Only `RUN = "train"` continues an unfinished training run; a crop-check run starts its own folder |
+| Checkpoint selection | Open | The group-balanced validation BCE is 0.637 for the best constant prediction, so a constant model can be selected and early stopping can count from it. To be replaced before the next training run |
+
 Kelanjutan QA 13 November: run `qa_20261113T005049_219029Z` telah direview dari
 Drive. Semua 103 file metadata cocok checksum; 300 hash header sampel cocok F01;
 123 preview tercatat (110 train/13 validation), 25 titik test dikecualikan.

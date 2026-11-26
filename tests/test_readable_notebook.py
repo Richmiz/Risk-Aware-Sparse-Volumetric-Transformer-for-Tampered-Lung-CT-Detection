@@ -110,13 +110,15 @@ class NotebookSourceTests(unittest.TestCase):
             source=cell.replace('Path("/content/rsvt-code")',f'Path(r"{tmp/"code"}")')
             before=list(sys.path)
             try:
-                for setting,expected in (('auto',str(unfinished)),('','')):
-                    scope={'PROJECT':str(tmp/'project'),'REPOSITORY':str(ROOT),'CODE_REF':'main','RESUME_SESSION':setting}
+                # A crop-check run never continues a training run; it starts its own folder.
+                for setting,run_kind,expected in (('auto','train',str(unfinished)),('auto','crop_check',''),('','train','')):
+                    scope={'PROJECT':str(tmp/'project'),'REPOSITORY':str(ROOT),'CODE_REF':'main','RESUME_SESSION':setting,
+                           'RUN':run_kind}
                     with patch('sys.stdout'):
                         exec(compile(source,'code-cell','exec'),scope)
                     self.assertEqual(scope['RESUME_FOLDER'],expected)
                     self.assertEqual(len(scope['RSVT_COMMIT']),40)
-                    if setting=='auto':self.assertEqual(scope['RSVT_COMMIT'],head)
+                    if expected:self.assertEqual(scope['RSVT_COMMIT'],head)
             finally:
                 sys.path[:]=before
 
@@ -128,6 +130,18 @@ class NotebookSourceTests(unittest.TestCase):
         self.assertIn('href="https://colab.research.google.com/github/Richmiz/Risk-Aware-Sparse-Volumetric-Transformer-'
                       'for-Tampered-Lung-CT-Detection/blob/main/notebooks/01_RSVT_TRAINING.ipynb"',''.join(first['source']))
         self.assertTrue(doc['metadata']['colab']['include_colab_link'])
+
+    def test_run_setting_chooses_the_crop_check_or_training(self):
+        doc=json.loads((ROOT/'notebooks/01_RSVT_TRAINING.ipynb').read_text(encoding='utf-8'))
+        code=[(c['id'],''.join(c['source'])) for c in doc['cells'] if c['cell_type']=='code']
+        names=[name for name,_ in code]
+        self.assertEqual(names[names.index('crop_check')+1],'training')  # the check comes before training
+        cells=dict(code)
+        self.assertIn('RUN = "crop_check"',cells['settings'])
+        self.assertIn('run=RUN',cells['session'])
+        self.assertIn('session.run_crop_check()',cells['crop_check'])
+        titles=[''.join(c['source']).splitlines()[0] for c in doc['cells'] if c['id'].endswith('-description')]
+        self.assertEqual([int(t.split('.')[0].removeprefix('## ')) for t in titles],list(range(1,len(titles)+1)))
 
     def test_runtime_is_released_only_after_the_save_check(self):
         doc=json.loads((ROOT/'notebooks/01_RSVT_TRAINING.ipynb').read_text(encoding='utf-8'))
