@@ -10,6 +10,10 @@ with the session, instead of loading a code release copied to Drive.
 
 26 Nov 2026: `RUN` chooses between the crop learning check (section 12) and training,
 after the first training run stayed at chance.
+
+26 Nov 2026 (later): the check passed on residual crops, so `RUN` defaults to training
+again, now with a residual crop input, AUROC-based checkpoint selection and a
+validation score with the edit's crop added.
 """
 
 from copy import deepcopy
@@ -105,8 +109,8 @@ def training_notebook():
         '1. **First, on a CPU runtime** (cheapest): it downloads and verifies the dataset, runs the data checks and stops '
         'before training. This takes hours; keep the tab open.\n'
         '2. **Then on a GPU runtime** (Runtime → Change runtime type → L4): it reads the saved dataset back, reuses the '
-        'checks and then does what `RUN` says. The current default, `RUN = "crop_check"`, checks that the crop network can '
-        'learn the edit (about 30 minutes) and does not train; `RUN = "train"` trains the model.\n'
+        'checks and then does what `RUN` says. The default, `RUN = "train"`, trains the model; `RUN = "crop_check"` only '
+        'checks that the crop network can learn the edit (about 30 minutes) and does not train.\n'
         '3. **After a disconnect**, Run all again: it continues the unfinished training run with the code it started with.\n\n'
         'When a run finishes and every saved file has been read back from Drive, the last cell releases the runtime so it '
         'stops using compute units; the outputs stay visible.\n\n'
@@ -129,7 +133,7 @@ def training_notebook():
          '`LIDC_ROOT` may point to an existing LIDC-IDRI download in Drive (NBIA folder layout).',
          'PROJECT = "/content/drive/MyDrive/Research/LUNG-CT-SCAN"\n'
          f'REPOSITORY = "{REPOSITORY}"\n'
-         'RUN = "crop_check"         # "crop_check" = can the crop network learn the edit? (no training); "train" = train\n'
+         'RUN = "train"              # "train" = train; "crop_check" = can the crop network learn the edit? (no training)\n'
          'CODE_REF = "main"          # code for a new run; a resumed run keeps the commit it started with\n'
          'RESUME_SESSION = "auto"    # "auto" = continue the latest unfinished run; "" = new run; or a run folder\n'
          'GENERATORS = ["cycle", "pix2pix", "diffusion"]  # remove one to hold it out\n'
@@ -197,14 +201,19 @@ def training_notebook():
          'is a manipulated crop and the same crop of its real scan, so they differ only in the changed voxels. Removals '
          'and insertions are balanced, so "is there a nodule here" cannot separate them. It fits 32 training pairs, then '
          'learns from up to 384 pairs and is tested on up to 192 pairs from unseen validation patients, once on the windowed '
-         'image the model sees and once on its residual (image minus local mean). Runs only with `RUN = "crop_check"` on a '
-         'GPU, in about 30 minutes. Expected output: a table, curves and a one-line conclusion. No test data is opened.',
+         'image and once on its residual (image minus local mean). On 26 Nov it learned the edit from the residual (removal '
+         'crop AUROC 0.94, insertion 0.75 on unseen patients) but not from the image (0.69), so the model now reads residual '
+         'crops. Runs only with `RUN = "crop_check"` on a GPU, in about 30 minutes. Expected output: a table, curves and a '
+         'one-line conclusion. No test data is opened.',
          'crop_check = session.run_crop_check() if session.has_store() else None\n'),
         ('training','13. Train and watch the epoch results',
          'Why: learn from training volumes and monitor validation volumes. On a GPU runtime with `RUN = "train"` this '
          'trains, or continues the unfinished run; otherwise it stops here with a message. Expected output: batch progress, an updating epoch '
-         'table and learning curves. The first epochs train without tail risk; the checkpoint is chosen among risk-stage epochs '
-         'by the validation loss averaged over authentic, removal and insertion volumes. Where a volume was edited is taken '
+         'table and learning curves. The crop network reads each crop minus its local mean (the residual), as in section 12. '
+         'The first epochs train without tail risk; the checkpoint is chosen among risk-stage epochs by the mean of removal '
+         'and insertion AUROC against authentic validation scans, and only if it beats chance (0.5), so a model that gives '
+         'every scan the same score is never chosen. Each validation scan is also scored with the edit\'s crop added; that '
+         'column shows what crop selection loses and is not used to choose the checkpoint. Where a volume was edited is taken '
          'from its changed voxels (manipulated vs real), not the author mask, which misses most of each removal. Checkpoints '
          'and logs save to Drive after every epoch.',
          'training_summary = session.train_when_ready(diagnostics) if session.has_store() else None\n'),
@@ -213,8 +222,9 @@ def training_notebook():
          'epoch_history = session.show_history()\n'),
         ('results','15. Inspect the selected model’s results',
          'Why: judge detection where it matters: removal (FB) and insertion (FM) against authentic scans, per generator, '
-         'router recall (did the chosen crops contain the edit?) and overlap with the changed voxels, then how those labels '
-         'compare with the author mask. Operating points are exploratory.',
+         'router recall (did the chosen crops contain the edit?), the score with the edit\'s crop added (what routing loses) '
+         'and overlap with the changed voxels, then how those labels compare with the author mask. Operating points are '
+         'exploratory.',
          'selected_model_results = session.show_results()\n'),
         ('test','16. Understand the held-out test set',
          'Why: keep an independent final check. Test patients are not acquired or opened by this notebook.',

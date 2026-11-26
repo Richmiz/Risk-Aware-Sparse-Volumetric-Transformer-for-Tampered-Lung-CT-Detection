@@ -314,7 +314,7 @@ class VolumeCase:
     """One volume for one epoch: coarse view, cells, labels and a crop provider."""
 
     def __init__(self, store, volume, *, flip, grid, crop_mm, forced, random_centers, rng, jitter_fraction,
-                 body_threshold=.04):
+                 body_threshold=.04, check_site=False):
         self.store, self.volume, self.flip, self.grid = store, volume, flip, grid
         info = store.series[volume["series_key"]]
         self.native_shape = tuple(info["shape_zyx"])
@@ -371,6 +371,22 @@ class VolumeCase:
         if random_centers and len(valid_cells):
             chosen = rng.choice(valid_cells, size=min(random_centers, len(valid_cells)), replace=False)
             self.random = [self.cell_centers[c] + rng.uniform(-jitter, jitter) for c in chosen]
+        # Validation diagnostic, never used for selection or training: one extra crop at the
+        # edit (the author site) or, for an authentic scan, at one of its real sites. It shows
+        # how the model scores a scan when the crop holding the edit is read for certain.
+        self.check_center, self.check_source = None, None
+        if check_site:
+            pick = _rng(volume["volume_id"], "check_site")  # independent of the case RNG
+            sites = sorted(store.sites.get(volume["series_key"], []), key=lambda s: (s["img_id"], s["site_label"]))
+            if self.tampered and self.site_center is not None:
+                self.check_center, self.check_source = self.site_center, "author_site"
+            elif not self.tampered and sites:
+                item = sites[int(pick.integers(len(sites)))]
+                self.check_center = self.to_view(np.asarray(item["center_zyx"], dtype=float))
+                self.check_source = "real_site_" + item["site_label"]
+            elif not self.tampered and len(valid_cells):
+                self.check_center = self.cell_centers[int(pick.choice(valid_cells))]
+                self.check_source = "body_cell"
 
     def to_view(self, native_zyx):
         out = np.array(native_zyx, dtype=float)
@@ -400,11 +416,15 @@ class VolumeCase:
 
 class M3DDataset:
     def __init__(self, store, split, *, seed=13, train=False, flip_probability=.5, grid=12, crop_mm=48.,
-                 forced_sites=1, random_crops=4, jitter_fraction=.25, generators=None, eligible_only=True):
+                 forced_sites=1, random_crops=4, jitter_fraction=.25, generators=None, eligible_only=True,
+                 check_site=False):
         if split not in ("train", "validation", "test"):
             raise ValueError("Unknown split")
         if not train and (flip_probability or forced_sites or random_crops):
             flip_probability, forced_sites, random_crops = 0., 0, 0
+        if train and check_site:
+            raise ValueError("The site-crop diagnostic is for evaluation only")
+        self.check_site = check_site
         self.store, self.split, self.seed, self.train = store, split, seed, train
         self.flip_probability, self.grid, self.crop_mm = flip_probability, grid, crop_mm
         self.forced_sites, self.random_crops, self.jitter = forced_sites, random_crops, jitter_fraction
@@ -427,4 +447,4 @@ class M3DDataset:
         return VolumeCase(self.store, volume, flip=flip, grid=self.grid, crop_mm=self.crop_mm,
                           forced=self.forced_sites if self.train else 0,
                           random_centers=self.random_crops if self.train else 0, rng=rng,
-                          jitter_fraction=self.jitter if self.train else 0.)
+                          jitter_fraction=self.jitter if self.train else 0., check_site=self.check_site)

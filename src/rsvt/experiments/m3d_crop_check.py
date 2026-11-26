@@ -36,7 +36,7 @@ from torch.nn import functional as F
 from rsvt.data.m3dsynth_dataset import _rng
 from rsvt.data.m3dsynth_store import write_json
 from rsvt.evaluation.classification import binary_auroc
-from rsvt.models.coarse_to_fine import FineBranch
+from rsvt.models.coarse_to_fine import FineBranch, local_residual
 
 SCHEMA = "m3d_crop_check_v1"
 OPERATIONS = ("removal", "insertion")
@@ -106,7 +106,7 @@ def extract_pairs(store, volumes, shape, margin, progress=None):
 
 def residual(images):
     """Image minus its 3x3x3 local mean: suppresses anatomy, keeps fine texture and seams."""
-    return images - F.avg_pool3d(images, 3, stride=1, padding=1, count_include_pad=False)
+    return local_residual(images)
 
 
 def _inputs(images, kind):

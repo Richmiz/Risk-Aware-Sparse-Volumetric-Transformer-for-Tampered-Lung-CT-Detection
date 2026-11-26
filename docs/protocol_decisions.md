@@ -130,6 +130,19 @@ validation scan about the same score (tamper AUROC 0.427). Details in [rsvt_c2f_
 | Auto-resume | Narrowed | Only `RUN = "train"` continues an unfinished training run; a crop-check run starts its own folder |
 | Checkpoint selection | Open | The group-balanced validation BCE is 0.637 for the best constant prediction, so a constant model can be selected and early stopping can count from it. To be replaced before the next training run |
 
+## Amendment 26 November 2026 (evening) — after the crop learning check
+
+The crop learning check (L4, commit `2884b66`, 192 validation pairs from 64 unseen patients) found that a fresh
+crop network learns the edit from the residual (crop AUROC removal 0.94, insertion 0.75) but not from the windowed
+image (0.69 for both), which it fitted by memorising anatomy. Details in [rsvt_c2f_m3dsynth.md](rsvt_c2f_m3dsynth.md).
+
+| Decision | Status | Rule |
+|---|---|---|
+| Crop network input | Changed | `fine_input = "residual"`: each crop minus its 3×3×3 local mean (the filter tested in the check) |
+| Checkpoint selection | Changed (closes the open item above) | Highest mean of removal-vs-authentic and insertion-vs-authentic validation AUROC among risk-stage epochs; starts at chance (0.5) and needs a gain of `min_delta`, so a constant model is never selected; early stopping counts epochs without a new best. If no epoch beats chance, the last epoch is reported and labelled so. Checkpoint format `rsvt_c2f_state_v2` |
+| Site-crop diagnostic | Added | Each validation scan is also scored with one extra crop at the author manipulation centre (manipulated) or one of its series' real TB/TM sites (authentic); reports scan AUROC with that crop and crop AUROC on it alone. Diagnostic only: never used for selection or training; router-only scores unchanged |
+| Next GPU run | Changed | `RUN = "train"` is the notebook default again |
+
 Kelanjutan QA 13 November: run `qa_20261113T005049_219029Z` telah direview dari
 Drive. Semua 103 file metadata cocok checksum; 300 hash header sampel cocok F01;
 123 preview tercatat (110 train/13 validation), 25 titik test dikecualikan.

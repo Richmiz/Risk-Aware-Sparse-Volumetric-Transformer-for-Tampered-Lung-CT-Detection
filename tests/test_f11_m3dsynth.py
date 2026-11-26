@@ -488,6 +488,27 @@ class StoreAndDataset(unittest.TestCase):
         self.assertEqual((case.forced, case.random), ([], []))
         self.assertTrue(all(v["split"] == "validation" for v in dataset.rows))
 
+    def test_validation_site_crop_is_the_edit_or_a_real_site_and_never_trains(self):
+        with self.assertRaises(ValueError):
+            M3DDataset(self.store, "train", train=True, check_site=True)
+        plain = M3DDataset(self.store, "validation", train=False)
+        checked = M3DDataset(self.store, "validation", train=False, check_site=True)
+        sources = Counter()
+        for index in range(len(checked)):
+            case, again, base = checked[index], checked[index], plain[index]
+            self.assertIsNone(base.check_center)
+            np.testing.assert_array_equal(case.check_center, again.check_center)  # the same site every epoch
+            np.testing.assert_array_equal(case.cell_target, base.cell_target)  # nothing else about the case changes
+            self.assertEqual((case.forced, case.random), ([], []))
+            sources[case.check_source] += 1
+            if case.tampered:
+                self.assertEqual(case.check_source, "author_site")
+                np.testing.assert_array_equal(case.check_center, case.site_center)
+                self.assertEqual(float(case.crops([case.check_center])["tamper"][0]), 1.)  # the crop holds the edit
+            else:
+                self.assertIn(case.check_source, ("real_site_TB", "real_site_TM"))
+        self.assertTrue(sources["author_site"] and sum(sources.values()) > sources["author_site"])
+
 
 class ModelAndLosses(unittest.TestCase):
     def test_forward_backward_selection_and_estimate(self):
@@ -511,6 +532,27 @@ class ModelAndLosses(unittest.TestCase):
         estimate = compute_estimate(model, (96, 96, 96), (16, 32, 32), 3, (300, 512, 512))
         self.assertGreater(estimate["dense_over_sparse"], 1.)
         self.assertLess(estimate["native_voxels_read_fraction"], .01)
+
+    def test_fine_branch_reads_the_residual_by_default(self):
+        from rsvt.experiments.m3d_crop_check import residual
+        from rsvt.models.coarse_to_fine import FineBranch, local_residual
+        torch.manual_seed(0)
+        model = CoarseToFineRSVT(dimension=16, heads=2, layers=1, coarse_widths=(4, 8, 8), fine_widths=(4, 8, 8),
+                                 router_hidden=8, router_prior=.01, crops_at_inference=3).eval()
+        self.assertEqual(model.fine.input, "residual")
+        self.assertEqual(FineBranch(16, (4, 8, 8)).input, "image")  # the crop check's arms filter their own input
+        with self.assertRaises(ValueError):
+            FineBranch(16, (4, 8, 8), input="gradient")
+        image = torch.rand(2, 1, 16, 32, 32)
+        valid = torch.ones_like(image, dtype=torch.bool)
+        torch.testing.assert_close(residual(image), local_residual(image), rtol=0, atol=0)  # the check's filter
+        with torch.no_grad():
+            # A uniform brightness change is not evidence for the residual branch, but moves the image branch.
+            torch.testing.assert_close(model.encode_crops(image, valid)["tamper_logits"],
+                                       model.encode_crops(image + .3, valid)["tamper_logits"])
+            image_branch = FineBranch(16, (4, 8, 8)).eval()
+            self.assertFalse(torch.allclose(image_branch(image, valid)["tamper_logits"],
+                                            image_branch(image + .3, valid)["tamper_logits"]))
 
     def test_tail_risk_covers_both_sides_of_the_threshold(self):
         losses = torch.tensor([.1, 2., .3, .2, 1.5], requires_grad=True)
@@ -610,6 +652,45 @@ class Training(unittest.TestCase):
         self.assertAlmostEqual(metrics["group_balanced_volume_bce"], (1. + 4. + 0.) / 3)
         self.assertEqual(metrics["group_volume_bce"], {"authentic": 1., "insertion": 0., "removal": 4.})
 
+    def test_selection_auroc_weighs_operations_equally_and_a_constant_scores_chance(self):
+        def row(kind, operation, p, with_site, site_crop, source=None):
+            return {"kind": kind, "generator": "" if kind == "authentic" else "cycle", "operation": operation,
+                    "volume_loss": .5, "tamper_probability": p, "max_crop_probability": p, "removal_probability": .5,
+                    "router_hit": None if kind == "authentic" else operation == "removal",
+                    "tamper_probability_with_site": with_site, "site_crop_probability": site_crop, "site_source": source}
+        authentic = [row("authentic", "", .2, .1, .1, "real_site_TM"), row("authentic", "", .4, .2, .2, "real_site_TB")]
+        edited = [row("manipulated", "removal", .9, .8, .9)] + [row("manipulated", "insertion", p, .8, .9)
+                                                                 for p in (.1, .3, .3, .3)]
+        metrics = trainer.volume_metrics(authentic + edited, [.5])
+        self.assertAlmostEqual(metrics["removal_auroc"], 1.)
+        self.assertAlmostEqual(metrics["insertion_auroc"], 3 / 8)
+        self.assertAlmostEqual(metrics["tamper_auroc"], .5)  # pooled: the four insertions outweigh the removal
+        self.assertAlmostEqual(metrics["selection_auroc"], (1. + 3 / 8) / 2)  # one removal counts as much as four insertions
+        self.assertEqual(metrics["router_recall_by_operation"], {"insertion": 0., "removal": 1.})
+        site = metrics["with_site_crop"]
+        self.assertEqual((site["scans"], site["tamper_auroc"], site["crop_removal_auroc"]), (7, 1., 1.))
+        self.assertEqual(site["authentic_site_sources"], {"real_site_TB": 1, "real_site_TM": 1})
+        constant = [dict(r, tamper_probability=.6) for r in authentic + edited]
+        self.assertEqual(trainer.volume_metrics(constant, [.5])["selection_auroc"], .5)  # cannot beat the 0.5 start
+
+    def test_site_crop_diagnostic_leaves_router_only_scores_unchanged(self):
+        config = small_config()
+        store, _, checked, model = self._setup(config)
+        d = config["data"]
+        plain = M3DDataset(store, "validation", train=False, seed=config["training"]["seed"], grid=d["grid"],
+                           crop_mm=d["crop_mm"], generators=d["generators"])
+        model.eval()
+        with torch.inference_mode():
+            for index in range(len(checked)):
+                terms, outputs, _, _ = trainer.case_terms(model, checked[index], "cpu", config, train=False)
+                base_terms, base, _, _ = trainer.case_terms(model, plain[index], "cpu", config, train=False)
+                for key in ("tamper_probability", "removal_probability", "max_crop_probability", "router_hit"):
+                    self.assertEqual(outputs[key], base[key], key)
+                self.assertEqual(float(terms["volume"]), float(base_terms["volume"]))
+                self.assertNotIn("tamper_probability_with_site", base)
+                self.assertTrue(0. < outputs["tamper_probability_with_site"] < 1.)
+                self.assertTrue(0. < outputs["site_crop_probability"] < 1.)
+
     def test_fit_resume_matches_uninterrupted_and_reports(self):
         config = small_config()
         root = Path(self.tmp.name)
@@ -617,8 +698,20 @@ class Training(unittest.TestCase):
         self.assertTrue(summary["ok"] and summary["epochs_completed"] == 2)
         metrics = summary["validation_metrics"]
         self.assertEqual((metrics["authentic"], metrics["manipulated"]), (1, 4))
-        for key in ("tamper_auroc", "removal_auroc", "worst_generator_auroc", "router_recall_at_k", "operating_points"):
+        for key in ("tamper_auroc", "removal_auroc", "worst_generator_auroc", "router_recall_at_k", "operating_points",
+                    "selection_auroc", "router_recall_by_operation"):
             self.assertIn(key, metrics)
+        self.assertEqual(summary["selection_rule"], trainer.SELECTION_RULE)
+        if summary["best_epoch"] is None:  # nothing beat chance: the last epoch is reported, and says so
+            self.assertIsNone(summary["best_selection_auroc"])
+            self.assertIn("beat chance", summary["selection_note"])
+        else:
+            self.assertGreater(summary["best_selection_auroc"], .5)
+        self.assertEqual(metrics["with_site_crop"]["scans"], 5)
+        self.assertEqual(sum(metrics["with_site_crop"]["authentic_site_sources"].values()), 1)
+        predictions = json.loads((root / "runA/selected_validation_predictions.json").read_text())
+        self.assertTrue(all("tamper_probability_with_site" in p for p in predictions))
+        self.assertIn("With the edit's crop added (diagnostic)", (root / "runA/report.md").read_text(encoding="utf-8"))
         self.assertTrue((root / "runA/persistence_receipt.json").exists())
         estimate = json.loads((root / "runA/compute_estimate.json").read_text())
         self.assertGreater(estimate["dense_over_sparse"], 1.)

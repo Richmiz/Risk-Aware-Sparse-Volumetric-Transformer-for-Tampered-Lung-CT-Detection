@@ -12,6 +12,11 @@ Why this replaces the 96^3 token design (review, 17 Nov 2026)
   (primary) and removal vs insertion; per-crop tamper, visible-nodule and voxel
   mask heads use the author masks as supervision.
 
+26 Nov 2026: the fine branch reads the crop's residual (image minus its 3x3x3 local
+mean) by default. In the crop learning check a fresh fine branch learned the edit
+from residual crops on unseen patients (removal crop AUROC 0.94, insertion 0.75) but
+not from the windowed image (0.69 for both), which it fitted by memorising anatomy.
+
 All pooling is reshape/amax based and the decoder uses transposed convolutions, so
 CUDA backward stays deterministic under `torch.use_deterministic_algorithms`.
 """
@@ -25,8 +30,16 @@ from torch import nn
 from torch.nn import functional as F
 
 
+FINE_INPUTS = ("image", "residual")
+
+
 def _groups(channels):
     return max(1, min(8, channels // 4))
+
+
+def local_residual(images):
+    """Image minus its 3x3x3 local mean: suppresses anatomy, keeps fine texture and seams."""
+    return images - F.avg_pool3d(images, 3, stride=1, padding=1, count_include_pad=False)
 
 
 class ConvBlock(nn.Module):
@@ -91,10 +104,16 @@ class CoarseBranch(nn.Module):
 
 
 class FineBranch(nn.Module):
-    """Native crops -> token, crop tamper/visible logits and a half-resolution mask."""
+    """Native crops -> token, crop tamper/visible logits and a half-resolution mask.
 
-    def __init__(self, dimension=128, widths=(16, 32, 64)):
+    `input` chooses what the stem reads: the windowed image or its local residual.
+    """
+
+    def __init__(self, dimension=128, widths=(16, 32, 64), input="image"):
         super().__init__()
+        if input not in FINE_INPUTS:
+            raise ValueError("Fine input must be one of: " + ", ".join(FINE_INPUTS))
+        self.input = input
         a, b, c = widths
         self.stem = nn.Sequential(ConvBlock(2, a), ConvBlock(a, a))  # full-resolution texture
         self.s1 = nn.Sequential(ConvBlock(a, b, 2), ResBlock(b))
@@ -112,7 +131,8 @@ class FineBranch(nn.Module):
         if any(n % 8 for n in image.shape[2:]):
             raise ValueError("Crop sides must be multiples of 8")
         v = valid.float()
-        x = self.stem(torch.cat((image * v, v), 1))
+        signal = local_residual(image) if self.input == "residual" else image
+        x = self.stem(torch.cat((signal * v, v), 1))
         f1 = self.s1(x)
         f2 = self.s2(f1)
         f3 = self.s3(f2)
@@ -125,7 +145,8 @@ class FineBranch(nn.Module):
 
 class CoarseToFineRSVT(nn.Module):
     def __init__(self, dimension=128, heads=4, layers=3, dropout=.1, coarse_widths=(16, 32, 64),
-                 fine_widths=(16, 32, 64), router_hidden=64, router_prior=.003, crops_at_inference=16):
+                 fine_widths=(16, 32, 64), router_hidden=64, router_prior=.003, crops_at_inference=16,
+                 fine_input="residual"):
         super().__init__()
         if dimension % heads:
             raise ValueError("Transformer dimension must divide into heads")
@@ -133,7 +154,7 @@ class CoarseToFineRSVT(nn.Module):
             raise ValueError("crops_at_inference must be a positive integer")
         self.crops_at_inference = crops_at_inference
         self.coarse = CoarseBranch(dimension, coarse_widths, router_hidden, router_prior)
-        self.fine = FineBranch(dimension, fine_widths)
+        self.fine = FineBranch(dimension, fine_widths, fine_input)
         self.position = nn.Sequential(nn.Linear(3, dimension), nn.GELU(), nn.Linear(dimension, dimension))
         self.kind = nn.Embedding(2, dimension)
         self.crop_score = nn.Linear(1, dimension)

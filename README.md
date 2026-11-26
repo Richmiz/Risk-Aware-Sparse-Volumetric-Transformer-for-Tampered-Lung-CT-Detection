@@ -11,7 +11,7 @@ This repository contains the code for a study of detecting nodule injection and 
 The proposed model is a coarse-to-fine RSVT (Risk-Aware Sparse Volumetric Transformer):
 
 1. A 96³ view of the whole scan provides anatomical context and a router that scores a 12³ grid of cells.
-2. A full-resolution encoder runs only on the top-K selected cells, cropped from the native voxel grid, so small edits are not averaged away.
+2. A full-resolution encoder runs only on the top-K selected cells, cropped from the native voxel grid, so small edits are not averaged away. It reads each crop minus its local mean, which removes anatomy and keeps the generator's texture.
 3. A Transformer combines context tokens and crop tokens into two outputs: tampered versus authentic, and removal versus insertion.
 4. Training adds a tail-risk (CVaR) term over authentic, removal, and insertion volumes and a penalty on the spread of per-generator losses.
 
@@ -58,7 +58,7 @@ The study trains and validates on M3Dsynth, which edits LIDC-IDRI scans with thr
 [Open `notebooks/01_RSVT_TRAINING.ipynb` in Colab](https://colab.research.google.com/github/Richmiz/Risk-Aware-Sparse-Volumetric-Transformer-for-Tampered-Lung-CT-Detection/blob/main/notebooks/01_RSVT_TRAINING.ipynb) and use Run all; the defaults are ready. The notebook decides each stage from what is already saved in Google Drive:
 
 1. On a CPU runtime it checks free space, downloads and verifies the selected M3Dsynth samples and their LIDC-IDRI source series, runs the resolution and shortcut checks, and stops before training.
-2. On a GPU runtime (an L4 is the best value) it reads the saved dataset back against its checksums, reuses the checks, and then does what `RUN` says. The current default, `RUN = "crop_check"`, checks whether the model's crop network can learn the edit from crops that contain it, and does not train. `RUN = "train"` trains the model.
+2. On a GPU runtime (an L4 is the best value) it reads the saved dataset back against its checksums, reuses the checks, and then does what `RUN` says. The default, `RUN = "train"`, trains the model. `RUN = "crop_check"` only checks whether the model's crop network can learn the edit from crops that contain it, and does not train.
 3. After a disconnect, Run all again (with `RUN = "train"`) continues the unfinished training run with the code commit it started with.
 
 When a run finishes and every saved file has been read back from Drive, the last cell releases the Colab runtime so it stops using compute units (`SHUTDOWN_WHEN_DONE`).

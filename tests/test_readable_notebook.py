@@ -137,7 +137,7 @@ class NotebookSourceTests(unittest.TestCase):
         names=[name for name,_ in code]
         self.assertEqual(names[names.index('crop_check')+1],'training')  # the check comes before training
         cells=dict(code)
-        self.assertIn('RUN = "crop_check"',cells['settings'])
+        self.assertIn('RUN = "train"',cells['settings'])  # the check passed on 26 Nov; training is the default again
         self.assertIn('run=RUN',cells['session'])
         self.assertIn('session.run_crop_check()',cells['crop_check'])
         titles=[''.join(c['source']).splitlines()[0] for c in doc['cells'] if c['id'].endswith('-description')]

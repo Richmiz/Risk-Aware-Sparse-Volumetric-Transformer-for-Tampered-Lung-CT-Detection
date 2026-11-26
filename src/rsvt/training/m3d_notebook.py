@@ -437,14 +437,17 @@ class M3DNotebookSession:
                 ("Logical batch", f"{t['authentic_per_batch']} authentic + {t['manipulated_per_batch']} manipulated volumes"),
                 ("Crops per training volume", f"{t['router_crops_training']} router + {d['forced_sites']} site + {d['random_crops']} random"),
                 ("Crops at inference (compute budget)", m["crops_at_inference"]),
+                ("Crop network input", "residual: image minus its 3×3×3 local mean" if m.get("fine_input", "residual") == "residual"
+                 else "windowed image"),
                 ("Crop extent", f"{d['crop_mm']} mm on the native voxel grid"),
                 ("Augmentation", f"left-right flip p={d['flip_probability']}, crop jitter ±{d['jitter_fraction']} of crop size"),
                 ("Risk stage starts", f"epoch {t['risk_start_epoch'] + 1}"),
                 ("Tail risk (alpha / weight)", f"{r['alpha']} / {r['cvar_weight']}: authentic {r['authentic_weight']}, FB {r['fb_weight']}, FM {r['fm_weight']}"),
                 ("Generator-variance weight", r["generator_weight"]),
-                ("Checkpoint selection", "lowest validation volume BCE averaged over authentic, removal and insertion "
-                                         "(risk-stage epochs)"),
-                ("Early stopping", f"{t['patience']} risk-stage epochs without improvement" if t["patience"] else "off"),
+                ("Checkpoint selection", "highest mean of removal and insertion AUROC against authentic validation scans "
+                                         "(risk-stage epochs); must beat chance (0.5)"),
+                ("Early stopping", f"{t['patience']} risk-stage epochs without a new best" if t["patience"] else "off"),
+                ("Validation diagnostic", "each scan is also scored with the edit's crop added (not used for selection)"),
                 ("Seed / precision", f"{t['seed']} / FP32")]
         self._html(table_html(["Setting", "Value"], rows))
         self._save_json("displayed_configuration.json", {"settings": [list(map(str, r)) for r in rows]})
@@ -470,12 +473,14 @@ class M3DNotebookSession:
         return count
 
     def _history_html(self, rows):
-        number = lambda v, p=False: "—" if v is None else (f"{100 * v:.1f}%" if p else f"{v:.4f}")
-        return table_html(["Epoch", "Stage", "LR", "Train objective", "Val selection BCE", "Tamper AUROC", "Removal AUROC",
-                           "Worst-generator AUROC", "Router recall@K", "Removal recall @10% FPR"],
+        number = lambda v, p=False: "—" if v is None else (f"{100 * v:.1f}%" if p else f"{v:.3f}")
+        return table_html(["Epoch", "Stage", "LR", "Train objective", "Train crop loss", "Selection AUROC",
+                           "Removal AUROC", "Insertion AUROC", "Worst-generator AUROC", "AUROC with edit crop",
+                           "Router recall@K", "Removal recall @10% FPR"],
                           [[r["epoch"], r["stage"], f"{r['learning_rate']:.2g}", number(r["training_objective"]),
-                            number(r["validation_selection_bce"]), number(r["validation_tamper_auroc"]),
-                            number(r["validation_removal_auroc"]), number(r["validation_worst_generator_auroc"]),
+                            number(r.get("train_crop_tamper")), number(r.get("validation_selection_auroc")),
+                            number(r["validation_removal_auroc"]), number(r.get("validation_insertion_auroc")),
+                            number(r["validation_worst_generator_auroc"]), number(r.get("validation_tamper_auroc_with_site")),
                             number(r["validation_router_recall"], True), number(r["validation_removal_recall_fpr10"], True)]
                            for r in rows])
 
@@ -483,13 +488,16 @@ class M3DNotebookSession:
         import matplotlib.pyplot as plt
         figure, axes = plt.subplots(1, 2, figsize=(11, 3.6))
         epochs = [r["epoch"] for r in rows]
+        value = lambda r, key: np.nan if r.get(key) is None else r[key]
         axes[0].plot(epochs, [r["training_objective"] for r in rows], marker="o", label="Train objective")
-        axes[0].plot(epochs, [r["validation_selection_bce"] for r in rows], marker="o",
-                     label="Validation BCE (authentic / removal / insertion balanced)")
-        for key, label in (("validation_tamper_auroc", "Tamper AUROC"), ("validation_removal_auroc", "Removal AUROC"),
-                           ("validation_worst_generator_auroc", "Worst-generator AUROC")):
-            axes[1].plot(epochs, [np.nan if r[key] is None else r[key] for r in rows], marker="o", label=label)
-        axes[0].set(title="Loss", xlabel="Epoch")
+        axes[0].plot(epochs, [value(r, "train_crop_tamper") for r in rows], marker="o", label="Train crop loss")
+        axes[0].axhline(np.log(2), color="grey", linestyle=":", label="chance (BCE)")
+        for key, label in (("validation_selection_auroc", "Selection AUROC (removal & insertion)"),
+                           ("validation_removal_auroc", "Removal AUROC"), ("validation_insertion_auroc", "Insertion AUROC"),
+                           ("validation_tamper_auroc_with_site", "Tamper AUROC with the edit crop (diagnostic)")):
+            axes[1].plot(epochs, [value(r, key) for r in rows], marker="o", label=label)
+        axes[1].axhline(.5, color="grey", linestyle=":")
+        axes[0].set(title="Training loss", xlabel="Epoch")
         axes[1].set(title="Validation discrimination", xlabel="Epoch", ylim=(0, 1))
         for axis in axes:
             axis.grid(alpha=.2)
@@ -650,21 +658,35 @@ class M3DNotebookSession:
         summary = json.loads(path.read_text(encoding="utf-8"))
         m = summary["validation_metrics"]
         number = lambda v, p=False: "—" if v is None else (f"{100 * v:.1f}%" if p else f"{v:.3f}")
+        site = m.get("with_site_crop") or {}
+        recall = m.get("router_recall_by_operation") or {}
         rows = [("Validation volumes (authentic / manipulated)", f"{m['authentic']} / {m['manipulated']}"),
-                ("Selected epoch", summary["best_epoch"] or "provisional"), ("Tamper AUROC", number(m["tamper_auroc"])),
+                ("Selected epoch", summary["best_epoch"] or "none beat chance; last epoch shown"),
+                ("Selection AUROC (mean of removal and insertion)", number(m.get("selection_auroc"))),
+                ("Tamper AUROC", number(m["tamper_auroc"])),
                 ("Removal (FB) vs authentic AUROC", number(m["removal_auroc"])),
                 ("Insertion (FM) vs authentic AUROC", number(m["insertion_auroc"])),
                 ("Worst-generator AUROC", number(m["worst_generator_auroc"])),
                 ("Removal vs insertion accuracy", number(m.get("removal_vs_insertion_accuracy"), True)),
                 ("Router recall@K (an edited cell among selected crops)", number(m.get("router_recall_at_k"), True)),
-                ("Edit-mask Dice on selected crops at edited cells", number(m.get("mask_dice_on_hit_crops")))]
+                ("Router recall@K, removal / insertion",
+                 f"{number(recall.get('removal'), True)} / {number(recall.get('insertion'), True)}"),
+                ("Edit-mask Dice on selected crops at edited cells", number(m.get("mask_dice_on_hit_crops"))),
+                ("Diagnostic: tamper AUROC with the edit's crop added (removal / insertion)",
+                 f"{number(site.get('tamper_auroc'))} ({number(site.get('removal_auroc'))} / "
+                 f"{number(site.get('insertion_auroc'))})"),
+                ("Diagnostic: the edit's crop alone, crop-network AUROC (removal / insertion)",
+                 f"{number(site.get('crop_tamper_auroc'))} ({number(site.get('crop_removal_auroc'))} / "
+                 f"{number(site.get('crop_insertion_auroc'))})")]
         for name, point in m["operating_points"].items():
             rows.append((f"Removal / insertion recall at {name.replace('fpr_', '')} FPR (threshold from these authentic cases)",
                          f"{number(point['removal_recall'], True)} / {number(point['insertion_recall'], True)}"))
         self._html("<h3>Selected model — validation</h3>" + table_html(["Metric", "Value"], rows))
         self._html(table_html(["Generator", "AUROC vs authentic"], [(g, number(v)) for g, v in m["per_generator_auroc"].items()]))
         self._html("<p>Operating points are exploratory: the thresholds come from the same validation authentic volumes. "
-                   "Test volumes are not acquired or opened.</p>")
+                   "The diagnostic rows add one crop at the edit (for authentic scans, at one of their real sites); the gap "
+                   "between them and the router-only rows is what crop selection loses. They are not detection results "
+                   "and are not used to choose the checkpoint. Test volumes are not acquired or opened.</p>")
         labels_path = self.training_dir / "label_check.json"
         if labels_path.exists():
             groups = json.loads(labels_path.read_text(encoding="utf-8"))["groups"]
@@ -688,7 +710,11 @@ class M3DNotebookSession:
         text = f"# RSVT coarse-to-fine session\n\nOutput: `{self.root}`\n\nStore: `{self.store_root}`\n\n"
         if summary.exists():
             m = json.loads(summary.read_text(encoding="utf-8"))["validation_metrics"]
-            text += f"Validation tamper AUROC {m['tamper_auroc']}; removal AUROC {m['removal_auroc']}; worst generator {m['worst_generator_auroc']}.\n\n"
+            text += (f"Validation tamper AUROC {m['tamper_auroc']}; removal AUROC {m['removal_auroc']}; "
+                     f"insertion AUROC {m['insertion_auroc']}; worst generator {m['worst_generator_auroc']}.\n\n")
+            if m.get("with_site_crop"):
+                text += (f"Diagnostic with the edit's crop added: tamper AUROC {m['with_site_crop']['tamper_auroc']}; "
+                         f"that crop alone {m['with_site_crop']['crop_tamper_auroc']}.\n\n")
         else:
             text += "Training has not completed yet.\n\n"
         check = self.root / "crop_check" / "crop_check.json"

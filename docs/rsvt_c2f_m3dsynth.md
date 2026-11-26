@@ -6,6 +6,9 @@ proposed model; that design remains available as a negative control
 (`configs/training/rsvt_real_ct.toml`, see [rsvt_theory.md](rsvt_theory.md)).
 The store was built on 25–26 Nov 2026. One model has been trained on it, and it did
 not learn to detect tampering (see [First training run](#first-training-run-26-november-2026)).
+The [crop learning check](#crop-learning-check) then showed that the crop network learns
+the edit from residual crops but not from the windowed image, so the model now reads
+residual crops and checkpoints are chosen by AUROC.
 
 ## Why the design changed
 
@@ -91,11 +94,15 @@ samples, of which 3,493 were eligible in the store of 26 Nov 2026 (785 removals,
 ```text
 96³ coarse view ─ CNN ─► 12³ cell features ─► router logits (top-K cells)
                                 └──────────► 6³ context tokens
-K native crops ─ CNN (full-res stem) ─► crop token, crop tamper logit,
-                                        visible-nodule logit, half-res mask
+K native crops ─ residual ─ CNN (full-res stem) ─► crop token, crop tamper logit,
+                                                   visible-nodule logit, half-res mask
 [CLS] + context tokens + crop tokens ─ Transformer (3 layers) ─►
         tampered vs authentic  ·  removal vs insertion
 ```
+
+The crop network reads each crop minus its 3×3×3 local mean (`fine_input =
+"residual"`, from 26 Nov 2026), which removes anatomy and keeps the generator's
+texture and seams; see [Crop learning check](#crop-learning-check).
 
 Training crops per volume: 8 router top-K + 1 site crop (author mask centre for
 manipulated volumes; a TB/TM site for authentic ones) + 4 random body cells, all
@@ -117,12 +124,27 @@ authentic + 12 manipulated volumes, stratified by generator × operation; the
 batch objective is differentiated in scalar space and each volume is replayed
 with its recorded RNG and crop selection (tested equal to direct backprop).
 
-Checkpoint selection: lowest validation volume BCE averaged over three equal groups
-(authentic, removal, insertion) among risk-stage epochs, using hard top-K
-inference. Validation metrics: tamper AUROC, removal and
-insertion AUROC, per-generator and worst-generator AUROC, removal/insertion recall
-at 5% and 10% authentic FPR (exploratory thresholds), removal-vs-insertion
-accuracy, router recall@K and mask Dice on crops containing the site.
+Checkpoint selection (from 26 Nov 2026): the highest mean of removal-vs-authentic
+and insertion-vs-authentic validation AUROC among risk-stage epochs, using hard
+top-K inference. Selection starts at chance: an epoch is kept only if it beats 0.5
+by `min_delta`, and early stopping counts epochs without a new best. A model that
+gives every scan the same score therefore cannot be selected; if no epoch beats
+chance, the last epoch is reported and the summary says so. (The earlier rule,
+group-balanced validation BCE, let a constant model win: see
+[First training run](#first-training-run-26-november-2026).)
+
+Validation metrics: tamper AUROC, removal and insertion AUROC, per-generator and
+worst-generator AUROC, removal/insertion recall at 5% and 10% authentic FPR
+(exploratory thresholds), removal-vs-insertion accuracy, router recall@K (overall
+and per operation) and mask Dice on crops containing the site.
+
+**Site-crop diagnostic.** Each validation scan is scored a second time with one
+extra crop: at the author manipulation centre for a manipulated scan, and at one
+of the series' real TB/TM sites (chosen once per scan) for an authentic scan. It
+reports the scan AUROC with that crop added and the crop network's AUROC on that
+crop alone. The gap to the router-only scores is what crop selection loses. It is
+never used for selection or training, and the router-only scores are unchanged by
+it (tested).
 
 ## Diagnostics before training
 
@@ -167,7 +189,8 @@ the selected checkpoint is epoch 4. No test volume was opened.
   so its AUROCs below 0.5 are noise around a constant, not an inverted signal.
 * The selection score (validation BCE averaged over authentic, removal and insertion)
   is 0.637 for the best constant prediction. Epoch 4 won by being a better constant,
-  and early stopping counted from it. This rule must change before the next training run.
+  and early stopping counted from it. The rule was replaced the same day by an AUROC
+  rule that a constant cannot win (see [Objective](#objective)).
 * `label_check.json`: removals change 96% of the author mask box (median; 91% at the
   10th percentile) and reach 3.8× its depth, changing every slice in between;
   insertions stay inside their mask box.
@@ -196,11 +219,39 @@ and a one-line conclusion. Its thresholds (≥80% for both operations = learned)
 describe the result; they are not pre-registered endpoints. It removes crop
 selection, so it bounds what the crop stage can do and says nothing about routing.
 
+**Result (26 Nov 2026, L4, commit `2884b66`).** 384 training pairs (144 patients)
+and 192 validation pairs (64 patients), 64 per generator and operation in training
+and 32 in validation; no pair was dropped and no test volume was opened. At least
+97% of the changed voxels stayed visible after the HU window in 9 of 10 crops.
+
+| Arm (unseen patients) | Pairs ordered correctly, removal / insertion | Crop AUROC, removal / insertion / all |
+|---|---|---|
+| fit (32 training pairs) | 100% / 100% (training pairs) | — |
+| image | 67% / 81% | 0.69 / 0.69 / 0.69 |
+| residual | 96% / 84% | 0.94 / 0.75 / 0.86 |
+
+* On the windowed image the network fitted the training pairs (87.5%, crop AUROC 0.91)
+  but did not transfer: removal on unseen patients peaked at 86% at step 200 and fell
+  to 67%. It memorised anatomy.
+* On the residual it learned the edit: every cycle and diffusion removal was ordered
+  correctly, and pix2pix removals at 88%. Pix2pix insertion was weakest (crop AUROC
+  0.64). Insertion was still improving at step 2,000.
+* Early in training both arms ranked insertions below chance: they first learned
+  "no nodule = manipulated". The residual arm outgrew it, but part of the remaining
+  removal/insertion gap may be that bias; the rest is edit size (median changed
+  voxels per crop: 47% of the crop for removals, 14% for insertions).
+* Wilson 95% intervals for residual pairs ordered correctly: removal 90–98%,
+  insertion 76–90%. They ignore that a patient contributes up to 19 pairs.
+
+The first training run fed the crop network the windowed image, which explains much
+of why its crop loss stayed at chance. The model now reads residual crops
+(`fine_input = "residual"`).
+
 ## Running it
 
 Open `notebooks/01_RSVT_TRAINING.ipynb` in Colab from GitHub and use Run all. On a
-GPU, `RUN` chooses what the run does: `"crop_check"` (the current default) runs the
-crop learning check in section 12 and does not train; `"train"` trains in section 13.
+GPU, `RUN` chooses what the run does: `"train"` (the default) trains in section 13;
+`"crop_check"` runs the crop learning check in section 12 and does not train.
 With `RUN = "train"`, section 3 continues the latest unfinished training
 run when there is one (`RESUME_SESSION = "auto"`), checking out the commit that
 run started with; otherwise it clones the public repository at `CODE_REF`. Section
@@ -227,6 +278,10 @@ section 17 has read every saved file back; if an earlier cell fails, the runtime
   CT-GAN is not an independent external test until identities are reconciled.
 * The real-series conversion is a re-implementation; archive verification marks
   any mismatching sample ineligible rather than assuming equality.
+* The crop learning check places every crop on the edit. In the first training run
+  the router's 16 crops held the edit for 37% of manipulated validation scans, so
+  routing, not the crop stage, may now limit scan-level detection; the site-crop
+  diagnostic measures this.
 * Author masks do not cover the removal edits, so localization labels use the changed
   voxels. Why the removal edits are a voxel cube (as many slices as pixels) is not
   documented by the authors; `label_check.json` reports how much of each mask changed.

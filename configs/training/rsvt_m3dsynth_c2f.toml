@@ -32,6 +32,7 @@ fine_widths = [16, 32, 64]
 router_hidden = 64
 router_prior = 0.003      # initial cell probability (~5 of 1,728 cells)
 crops_at_inference = 16   # compute budget: native crops read per volume
+fine_input = "residual"   # crop network reads image minus 3x3x3 local mean (crop learning check, 26 Nov 2026)
 
 [training]
 mode = "engineering_pilot"
@@ -42,8 +43,8 @@ epochs = 30
 learning_rate = 0.0002
 weight_decay = 0.0001
 gradient_clip = 5.0
-patience = 8              # risk-stage epochs without validation improvement; 0 disables
-min_delta = 0.0001
+patience = 8              # risk-stage epochs without a new best selection AUROC; 0 disables
+min_delta = 0.0001        # selection AUROC gain that counts as an improvement
 exclude_norm_bias_decay = true
 lr_schedule = "warmup_cosine"
 warmup_epochs = 2

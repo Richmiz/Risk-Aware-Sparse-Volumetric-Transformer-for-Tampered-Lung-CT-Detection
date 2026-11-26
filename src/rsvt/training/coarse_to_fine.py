@@ -5,6 +5,15 @@ operation). Tail-risk terms need the whole batch, but one GPU holds one volume, 
 the objective is differentiated in per-case scalar space and each case is replayed
 with its recorded RNG state and recorded crop selection (scalar replay, as in the
 earlier RSVT trainer). Crop selection is non-differentiable and reused exactly.
+
+26 Nov 2026 (after the first run and the crop learning check):
+* Checkpoint selection maximises the mean of removal-vs-authentic and
+  insertion-vs-authentic validation AUROC, starting from chance (0.5). The earlier
+  rule (group-balanced validation BCE) let a constant model win, since the best
+  constant scores 0.637 there; a constant scores 0.5 here and can never be selected.
+* Validation also scores each scan with one extra crop at the edit (or, for an
+  authentic scan, at one of its real sites). This diagnostic separates what routing
+  loses from what the crop stage misses; it is never used for selection.
 """
 
 from __future__ import annotations
@@ -32,7 +41,12 @@ from rsvt.utils.reproducibility import restore_rng, rng_state, seed_everything
 
 TERMS = ("volume", "removal", "crop_tamper", "crop_visible", "mask", "router")
 TABLES = ("data", "acquisition", "model", "training", "loss", "risk", "evaluation")
-FORMAT = "rsvt_c2f_state_v1"
+FORMAT = "rsvt_c2f_state_v2"  # v2: `best` is the selection AUROC (higher is better), not a BCE
+SELECTION_RULE = ("highest mean of removal-vs-authentic and insertion-vs-authentic validation AUROC among "
+                  "risk-stage epochs, above chance (0.5) by at least min_delta (hard top-K inference)")
+SITE_CHECK_SCOPE = ("diagnostic only, never used for selection: each validation scan is scored again with one extra "
+                    "crop at the author manipulation centre (manipulated) or at one of its series' real TB/TM sites "
+                    "(authentic). The gap to router-only scores is what routing loses.")
 
 
 # --------------------------------------------------------------------------- config
@@ -148,6 +162,16 @@ def case_terms(model, case, device, config, *, train, selection=None):
                 truth = target[index]
                 outputs["mask_dice_selected"] = float((2 * (predicted * truth).sum() + 1e-6)
                                                       / (predicted.sum() + truth.sum() + 1e-6))
+            check = getattr(case, "check_center", None)
+            if check is not None:
+                # Diagnostic: the same scan with the edit's crop (or a real site's) added to the router's crops.
+                site = case.crops([check])
+                site_fine = model.encode_crops(site["image"].to(device), site["valid"].to(device))
+                joined = {k: torch.cat((fine[k], site_fine[k])) for k in ("tokens", "tamper_logits")}
+                with_site = model.fuse(coarse, joined, torch.cat((crops["positions"], site["positions"])).to(device))
+                outputs.update(tamper_probability_with_site=float(torch.sigmoid(with_site["tamper_logit"])),
+                               site_crop_probability=float(torch.sigmoid(site_fine["tamper_logits"][0])),
+                               site_source=case.check_source)
     meta = {"group": _group(case), "generator": case.volume["generator"], "tampered": case.tampered,
             "has_removal": bool(case.tampered), "has_visible": bool(labelled.any())}
     return terms, outputs, {"cells": cells}, meta
@@ -297,13 +321,28 @@ def volume_metrics(rows, fpr_targets):
     out["per_generator_auroc"] = per_generator
     known = [v for v in per_generator.values() if v is not None]
     out["worst_generator_auroc"] = min(known) if known else None
+    # Checkpoint selection: removal and insertion count equally (insertions outnumber removals
+    # about 4:1), and a constant score gives 0.5, so a model that ignores the scan cannot win.
+    operations = [v for v in (out["removal_auroc"], out["insertion_auroc"]) if v is not None]
+    out["selection_auroc"] = float(np.mean(operations)) if operations else None
+    checked = [r for r in rows if r.get("tamper_probability_with_site") is not None]
+    if checked:
+        real = [r for r in checked if r["kind"] == "authentic"]
+        edited = [r for r in checked if r["kind"] == "manipulated"]
+        site = {"scans": len(checked), "authentic_site_sources": dict(Counter(r["site_source"] for r in real)),
+                "scope": SITE_CHECK_SCOPE}
+        for name, items in (("tamper", edited), ("removal", [r for r in edited if r["operation"] == "removal"]),
+                            ("insertion", [r for r in edited if r["operation"] == "insertion"])):
+            site[name + "_auroc"] = auroc(items, real, "tamper_probability_with_site")
+            site["crop_" + name + "_auroc"] = auroc(items, real, "site_crop_probability")
+        out["with_site_crop"] = site
     losses = defaultdict(list)
     for r in rows:
         losses[r["kind"]].append(r["volume_loss"])
     out["balanced_volume_bce"] = float(np.mean([np.mean(v) for v in losses.values()])) if losses else None
     out["volume_bce"] = float(np.mean([r["volume_loss"] for r in rows])) if rows else None
-    # Checkpoint selection balances authentic, removal and insertion equally; pooling the
-    # manipulated volumes let insertions (707 vs 214 removals by default) decide it.
+    # Reported only (it chose checkpoints until 26 Nov 2026): BCE with authentic, removal and
+    # insertion weighted equally. Its best constant prediction scores 0.637.
     groups = defaultdict(list)
     for r in rows:
         groups["authentic" if r["kind"] == "authentic" else r["operation"]].append(r["volume_loss"])
@@ -329,6 +368,9 @@ def volume_metrics(rows, fpr_targets):
         out["removal_vs_insertion_accuracy"] = float(np.mean([(r["removal_probability"] > .5) == (r["operation"] == "removal")
                                                               for r in manipulated]))
         out["router_recall_at_k"] = float(np.mean([bool(r["router_hit"]) for r in manipulated]))
+        out["router_recall_by_operation"] = {op: float(np.mean([bool(r["router_hit"]) for r in manipulated
+                                                                 if r["operation"] == op]))
+                                             for op in sorted({r["operation"] for r in manipulated})}
         dice = [r["mask_dice_selected"] for r in manipulated if r.get("mask_dice_selected") is not None]
         out["mask_dice_on_hit_crops"] = float(np.mean(dice)) if dice else None
     return out
@@ -366,7 +408,8 @@ def fit(model, train, validation, config, output_dir, contract, *, resume=False,
     scheduler = build_scheduler(optimizer, t)
     weights = class_weights(config)
     binding = digest_json(contract)
-    history, best, bad, start, best_epoch = [], math.inf, 0, 0, None
+    # Selection starts at chance: an epoch is kept only if it beats 0.5 by min_delta.
+    history, best, bad, start, best_epoch = [], .5, 0, 0, None
     if resume:
         state = load_checkpoint(destination / "last.pt", binding, expected_format=FORMAT)
         model.load_state_dict(state["model"])
@@ -390,9 +433,9 @@ def fit(model, train, validation, config, output_dir, contract, *, resume=False,
                 progress({"event": "logical_batch", "epoch": epoch + 1, "batch": number, "batches": len(batches),
                           "objective": steps[-1]["objective"], "risk_active": risk_active})
         metrics, predictions = evaluate(model, validation, device, config, progress=progress)
-        score = metrics["group_balanced_volume_bce"]
+        score = metrics["selection_auroc"]
         eligible = risk_active
-        improved = eligible and score < best - t["min_delta"]
+        improved = eligible and score is not None and score > best + t["min_delta"]
         if improved:
             best, bad, best_epoch = score, 0, epoch + 1
         elif eligible:
@@ -401,10 +444,16 @@ def fit(model, train, validation, config, output_dir, contract, *, resume=False,
         row = {"epoch": epoch + 1, "stage": "risk" if risk_active else "warmup", "checkpoint_eligible": eligible,
                "learning_rate": optimizer.param_groups[0]["lr"], "optimizer_steps": len(steps),
                "training_objective": float(np.mean([s["objective"] for s in steps])), **{"train_" + k: v for k, v in mean_terms.items()},
-               "validation_selection_bce": score, "validation_balanced_bce": metrics["balanced_volume_bce"],
+               "validation_selection_auroc": score, "validation_balanced_bce": metrics["balanced_volume_bce"],
+               "validation_group_balanced_bce": metrics["group_balanced_volume_bce"],
                "validation_tamper_auroc": metrics["tamper_auroc"],
-               "validation_removal_auroc": metrics["removal_auroc"], "validation_worst_generator_auroc": metrics["worst_generator_auroc"],
+               "validation_removal_auroc": metrics["removal_auroc"], "validation_insertion_auroc": metrics["insertion_auroc"],
+               "validation_worst_generator_auroc": metrics["worst_generator_auroc"],
+               "validation_tamper_auroc_with_site": (metrics.get("with_site_crop") or {}).get("tamper_auroc"),
+               "validation_site_crop_auroc": (metrics.get("with_site_crop") or {}).get("crop_tamper_auroc"),
                "validation_router_recall": metrics.get("router_recall_at_k"),
+               "validation_router_recall_removal": (metrics.get("router_recall_by_operation") or {}).get("removal"),
+               "validation_router_recall_insertion": (metrics.get("router_recall_by_operation") or {}).get("insertion"),
                "validation_removal_recall_fpr10": metrics["operating_points"].get("fpr_0.1", {}).get("removal_recall"),
                "gradient_norm_mean": float(np.mean([s["gradient_norm"] for s in steps]))}
         history.append(row)
@@ -434,8 +483,10 @@ def fit(model, train, validation, config, output_dir, contract, *, resume=False,
                "epochs_completed": last, "training_finished": last >= t["epochs"] or bool(t["patience"] and bad >= t["patience"]),
                "best_epoch": best_epoch, "reported_checkpoint_epoch": state["epoch"],
                "checkpoint_stage": "risk" if best_epoch else "provisional_warmup_or_last",
-               "selection_rule": ("minimum validation volume BCE averaged over authentic, removal and insertion "
-                                  "among risk-stage epochs (hard top-K inference)"),
+               "selection_rule": SELECTION_RULE, "best_selection_auroc": best if best_epoch else None,
+               "selection_note": (None if best_epoch else
+                                  "No risk-stage epoch beat chance on the selection AUROC; the last epoch is reported."),
+               "site_crop_check": SITE_CHECK_SCOPE,
                "train_volumes": dict(Counter(v["kind"] for v in train.rows)),
                "validation_volumes": dict(Counter(v["kind"] for v in validation.rows)),
                "class_weights": weights, "validation_metrics": metrics, "history": history,
@@ -476,7 +527,7 @@ def build_datasets(store, config):
     common = dict(seed=config["training"]["seed"], grid=d["grid"], crop_mm=d["crop_mm"], generators=d["generators"])
     train = M3DDataset(store, "train", train=True, flip_probability=d["flip_probability"], forced_sites=d["forced_sites"],
                        random_crops=d["random_crops"], jitter_fraction=d["jitter_fraction"], **common)
-    validation = M3DDataset(store, "validation", train=False, **common)
+    validation = M3DDataset(store, "validation", train=False, check_site=True, **common)
     return train, validation
 
 
@@ -522,7 +573,10 @@ def run_training(store_root, cache_root, config, output_dir, *, resume=False, pr
              f"Train volumes: {summary['train_volumes']}; validation: {summary['validation_volumes']}; test opened: 0.", "",
              f"Selected epoch: {summary['best_epoch']} ({summary['selection_rule']}).", "",
              f"Validation tamper AUROC {metrics['tamper_auroc']}; removal AUROC {metrics['removal_auroc']}; "
-             f"worst-generator AUROC {metrics['worst_generator_auroc']}; router recall@K {metrics.get('router_recall_at_k')}.", "",
+             f"insertion AUROC {metrics['insertion_auroc']}; worst-generator AUROC {metrics['worst_generator_auroc']}; "
+             f"router recall@K {metrics.get('router_recall_at_k')}.", "",
+             f"With the edit's crop added (diagnostic): tamper AUROC {(metrics.get('with_site_crop') or {}).get('tamper_auroc')}; "
+             f"that crop alone {(metrics.get('with_site_crop') or {}).get('crop_tamper_auroc')}.", "",
              "Operating points are exploratory (thresholds from the same validation authentic volumes).", ""]
     (output / "report.md").write_text("\n".join(lines), encoding="utf-8")
     persist_receipt(output)
