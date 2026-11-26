@@ -442,7 +442,8 @@ def fit(model, train, validation, config, output_dir, contract, *, resume=False,
                "optimization": optimization_report(optimizer, t), "parameters": sum(p.numel() for p in model.parameters()),
                "wall_seconds_this_invocation": time.perf_counter() - began, "device": str(device),
                "test_volumes_opened": 0, "annotation_points_used": False,
-               "supervision": "author voxel masks and manipulation centres (M3Dsynth), training only; inference uses router top-K",
+               "supervision": ("changed voxels (manipulated != real) for router, crop and mask targets; author "
+                               "manipulation centres for the site crop (M3Dsynth), training only; inference uses router top-K"),
                "limitations": ["Exploratory: thresholds are set on the same validation authentic volumes.",
                                "LIDC-IDRI sources may overlap CT-GAN scans; do not treat CT-GAN as independent without identity checks.",
                                "Volume-level authentic count limits the resolution of low-FPR operating points."]}
@@ -485,6 +486,13 @@ def run_training(store_root, cache_root, config, output_dir, *, resume=False, pr
     train, validation = build_datasets(store, config)
     store.localize(train.rows + validation.rows, progress=progress)
     output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    labels = store.label_check(train.rows + validation.rows)
+    write_json(output / "label_check.json", labels)
+    if progress:
+        progress({"stage": "labels", **{op: {"volumes": g["volumes"], "mask_changed": (g["mask_changed"] or {}).get("median"),
+                                              "depth_ratio": (g["depth_ratio"] or {}).get("median")}
+                                         for op, g in labels["groups"].items() if ":" not in op}})
     contract = {"model": "RSVT-C2F", "implementation_sha256": implementation_fingerprint(),
                 "config_sha256": digest_json(config), "manifest_sha256": sha256_path(Path(store_root) / "manifest.json"),
                 "assignments_sha256": store.manifest["assignments_sha256"]}

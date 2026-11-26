@@ -7,11 +7,15 @@
 * Native crops: the router's cells and the training sites are cut from the 1 mm-
   class native voxel grid (no resampling), so generator traces are kept.
 * Flips: left-right only, deterministic per (seed, epoch, volume).
+* Labels: where a volume was edited comes from its changed voxels (manipulated !=
+  real), not from the author mask. On M3Dsynth removals the authors' mask is a
+  ~33 mm cube while the changed voxels span a cube with as many slices as pixels,
+  3-5x deeper on 2-3 mm slices (store of 26 Nov 2026).
 """
 
 from __future__ import annotations
 
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 import hashlib
 import json
 from pathlib import Path
@@ -101,6 +105,43 @@ def _rng(*parts):
     return np.random.default_rng(int.from_bytes(hashlib.sha256(json.dumps(parts).encode()).digest()[:8], "little"))
 
 
+def changed_bbox(changed, start):
+    """Bounding box [lo, hi) of the changed voxels in scan coordinates, as streaming records it."""
+    points = np.argwhere(changed)
+    if not len(points):
+        return None
+    return [[int(v) for v in points.min(0) + start], [int(v) for v in points.max(0) + 1 + start]]
+
+
+def crop_tamper_threshold(changed_total, changed_extent, crop_shape, fraction=.25):
+    """Changed voxels a crop must hold to count as tampered.
+
+    A quarter of the changed voxels a crop of this shape can hold: all of them when the
+    edit fits inside the crop (the earlier rule), and the crop's share along each axis
+    when the edit is longer, as M3Dsynth removals are on thick slices.
+    """
+    share = float(np.prod([min(1., c / max(e, 1)) for c, e in zip(crop_shape, changed_extent)]))
+    return fraction * changed_total * share
+
+
+LABEL_FIELDS = ("changed_voxels", "mask_voxels", "mask_changed", "changed_in_mask", "depth_ratio", "changed_slice_fill")
+
+
+def label_statistics(changed, mask):
+    """How one sample's changed voxels relate to the author mask (both in box coordinates)."""
+    both = int(np.count_nonzero(changed & mask))
+    n_changed, n_mask = int(np.count_nonzero(changed)), int(np.count_nonzero(mask))
+    changed_z = np.flatnonzero(changed.any(axis=(1, 2)))
+    mask_z = np.flatnonzero(mask.any(axis=(1, 2)))
+    changed_span = int(changed_z[-1] - changed_z[0] + 1) if len(changed_z) else 0
+    mask_span = int(mask_z[-1] - mask_z[0] + 1) if len(mask_z) else 0
+    return {"changed_voxels": n_changed, "mask_voxels": n_mask,
+            "mask_changed": both / n_mask if n_mask else None,            # share of the author mask that changed
+            "changed_in_mask": both / n_changed if n_changed else None,   # share of the edit inside the author mask
+            "depth_ratio": changed_span / mask_span if mask_span else None,
+            "changed_slice_fill": len(changed_z) / changed_span if changed_span else None}  # < 1: skipped slices
+
+
 class M3DStore:
     """Read-only access to a verified store, with a local cache for random access."""
 
@@ -113,6 +154,7 @@ class M3DStore:
         self.resampler = resampler or AreaResampler(COARSE_SHAPE)
         self._luts, self._real, self._coarse = {}, {}, {}
         self._boxes, self._box_cache = OrderedDict(), box_cache
+        self.label_stats = {}
         self.sites = {}
         for site in self.manifest["sites"]:
             self.sites.setdefault(site["series_key"], []).append(site)
@@ -143,6 +185,12 @@ class M3DStore:
         return self._coarse[key]
 
     def box(self, volume):
+        """(manipulated box, changed voxels, author mask) for one sample, in box coordinates.
+
+        The changed voxels (manipulated != real) are the training labels. For an eligible
+        sample their bounding box must equal the one measured while streaming, so the labels
+        describe exactly the edit that was verified.
+        """
         key = volume["volume_id"]
         if key in self._boxes:
             self._boxes.move_to_end(key)
@@ -155,10 +203,17 @@ class M3DStore:
             local.parent.mkdir(parents=True, exist_ok=True)
             local.write_bytes(path.read_bytes())
         with np.load(local, allow_pickle=False) as data:
-            item = (data["scan"].copy(), data["mask"].copy())
+            scan, mask = data["scan"].copy(), data["mask"].copy()
         expected = [b - a for a, b in zip(volume["box_start_zyx"], volume["box_stop_zyx"])]
-        if list(item[0].shape) != expected or item[1].shape != item[0].shape:
+        if list(scan.shape) != expected or mask.shape != scan.shape:
             raise ValueError("Box shape differs from manifest: " + key)
+        (z0, y0, x0), (z1, y1, x1) = volume["box_start_zyx"], volume["box_stop_zyx"]
+        changed = scan != np.asarray(self.real(volume["series_key"])[z0:z1, y0:y1, x0:x1])
+        if volume.get("eligible") and changed_bbox(changed, volume["box_start_zyx"]) != volume.get("diff_bbox"):
+            raise ValueError("Changed voxels differ from the edit verified while streaming: " + key)
+        if key not in self.label_stats:
+            self.label_stats[key] = label_statistics(changed, mask)
+        item = (scan, changed, mask)
         self._boxes[key] = item
         if len(self._boxes) > self._box_cache:
             self._boxes.popitem(last=False)
@@ -176,12 +231,39 @@ class M3DStore:
             if volume["kind"] == "manipulated":
                 self.box(volume)
 
+    def label_check(self, volumes):
+        """Training labels (changed voxels) against the author masks, by operation and generator."""
+        groups = defaultdict(list)
+        for volume in volumes:
+            if volume["kind"] != "manipulated":
+                continue
+            if volume["volume_id"] not in self.label_stats:
+                self.box(volume)
+            stats = self.label_stats[volume["volume_id"]]
+            groups[volume["operation"]].append(stats)
+            groups[f"{volume['operation']}:{volume['generator']}"].append(stats)
+
+        def summary(rows):
+            out = {"volumes": len(rows)}
+            for name in LABEL_FIELDS:
+                values = [r[name] for r in rows if r[name] is not None]
+                out[name] = (dict(zip(("p10", "median", "p90"), (float(v) for v in np.percentile(values, [10, 50, 90]))))
+                             if values else None)
+            return out
+        return {"schema_version": "m3d_label_check_v1",
+                "labels": "changed voxels (manipulated != real); the author mask only places the site crop",
+                "fields": {"mask_changed": "share of the author mask that changed",
+                           "changed_in_mask": "share of the changed voxels inside the author mask",
+                           "depth_ratio": "slices spanned by the changes / slices spanned by the mask",
+                           "changed_slice_fill": "slices with a change / slices spanned by the changes"},
+                "groups": {k: summary(v) for k, v in sorted(groups.items())}, "test_volumes_opened": 0}
+
     def coarse(self, volume):
         """96^3 normalized view of the (possibly manipulated) volume, unflipped."""
         key = volume["series_key"]
         view = self.coarse_real(key).copy()
         if volume["kind"] == "manipulated":
-            scan, _ = self.box(volume)
+            scan = self.box(volume)[0]
             (z0, y0, x0), (z1, y1, x1) = volume["box_start_zyx"], volume["box_stop_zyx"]
             lut = self.lut(key)
             real = np.asarray(self.real(key)[z0:z1, y0:y1, x0:x1])
@@ -189,25 +271,28 @@ class M3DStore:
         return view
 
     def crop(self, volume, center_native, shape):
-        """Native crop (uint16 -> window) with the manipulated box pasted; zero outside the scan."""
+        """Native crop (uint16 -> window) with the manipulated box pasted; zero outside the scan.
+
+        Returns the image, the in-scan voxels and the changed voxels (the edit label) in the crop.
+        """
         key = volume["series_key"]
         real = self.real(key)
         full = self.series[key]["shape_zyx"]
         start = [int(round(c - s / 2.)) for c, s in zip(center_native, shape)]
         u16 = np.zeros(shape, dtype=np.uint16)
         valid = np.zeros(shape, dtype=bool)
-        mask = np.zeros(shape, dtype=bool)
+        edit = np.zeros(shape, dtype=bool)
         src, dst = [], []
         for a, s, n in zip(start, shape, full):
             lo, hi = max(a, 0), min(a + s, n)
             if hi <= lo:
-                return np.zeros(shape, np.float32), valid, mask
+                return np.zeros(shape, np.float32), valid, edit
             src.append(slice(lo, hi))
             dst.append(slice(lo - a, hi - a))
         u16[tuple(dst)] = real[tuple(src)]
         valid[tuple(dst)] = True
         if volume["kind"] == "manipulated":
-            scan, box_mask = self.box(volume)
+            scan, changed, _ = self.box(volume)
             b0, b1 = volume["box_start_zyx"], volume["box_stop_zyx"]
             src, dst, empty = [], [], False
             for a, s, lo_b, hi_b in zip(start, shape, b0, b1):
@@ -219,10 +304,10 @@ class M3DStore:
                 dst.append(slice(lo - a, hi - a))
             if not empty:
                 u16[tuple(dst)] = scan[tuple(src)]
-                mask[tuple(dst)] = box_mask[tuple(src)]
+                edit[tuple(dst)] = changed[tuple(src)]
         image = self.lut(key)[u16]
         image[~valid] = 0.
-        return image, valid, mask & valid
+        return image, valid, edit & valid
 
 
 class VolumeCase:
@@ -249,17 +334,22 @@ class VolumeCase:
         self.tampered = float(volume["kind"] == "manipulated")
         self.removal = (1. if volume["operation"] == "removal" else 0.) if self.tampered else -1.
         self.cell_target = np.zeros(g ** 3, dtype=np.float32)
-        self.mask_total = int(volume.get("mask_voxels", 0))
+        self.changed_total, self.tamper_threshold = 0, 0.
         self.site_center = None
         if self.tampered:
+            # Router targets: every cell holding a changed voxel.
+            points = np.argwhere(store.box(volume)[1]) + np.asarray(volume["box_start_zyx"])
+            self.changed_total = len(points)
+            if self.changed_total:
+                cells = np.floor((self.to_view(points) + .5) * g / np.asarray(self.native_shape)).astype(int).clip(0, g - 1)
+                self.cell_target[np.unique((cells[:, 0] * g + cells[:, 1]) * g + cells[:, 2])] = 1.
+                extent = points.max(0) - points.min(0) + 1
+                self.tamper_threshold = crop_tamper_threshold(self.changed_total, extent, self.crop_shape)
+            # The site crop stays at the authors' declared site (the centre of their mask box);
+            # on the first full store it lay within a voxel of the centre of the changed voxels.
             lo, hi = (np.asarray(v, dtype=float) for v in volume["mask_bbox"])
             lo_v, hi_v = self.to_view(lo), self.to_view(hi - 1)
-            lo_v, hi_v = np.minimum(lo_v, hi_v), np.maximum(lo_v, hi_v)
-            first = np.floor((lo_v + .5) * g / np.asarray(self.native_shape)).astype(int).clip(0, g - 1)
-            last = np.floor((hi_v + .5) * g / np.asarray(self.native_shape)).astype(int).clip(0, g - 1)
-            hits = np.all((idx >= first) & (idx <= last), axis=1)
-            self.cell_target[hits] = 1.
-            self.site_center = (lo_v + hi_v) / 2.
+            self.site_center = (np.minimum(lo_v, hi_v) + np.maximum(lo_v, hi_v)) / 2.
         # Cells supervised by the router loss: every true cell is a positive even when it
         # fails the body test, but the label never adds selection candidates (that leaked
         # the answer into validation routing; review of 24 Nov 2026).
@@ -293,14 +383,14 @@ class VolumeCase:
         images, valids, masks, tamper, positions = [], [], [], [], []
         for center in centers_view:
             native = self.to_view(center)  # the x-flip is its own inverse
-            image, valid, mask = self.store.crop(self.volume, native, self.crop_shape)
+            image, valid, edit = self.store.crop(self.volume, native, self.crop_shape)
             if self.flip:
-                image, valid, mask = image[..., ::-1], valid[..., ::-1], mask[..., ::-1]
+                image, valid, edit = image[..., ::-1], valid[..., ::-1], edit[..., ::-1]
             images.append(np.ascontiguousarray(image))
             valids.append(np.ascontiguousarray(valid))
-            masks.append(np.ascontiguousarray(mask))
-            inside = int(mask.sum())
-            tamper.append(float(self.tampered and self.mask_total and inside >= .25 * self.mask_total))
+            masks.append(np.ascontiguousarray(edit))
+            inside = int(edit.sum())
+            tamper.append(float(bool(self.tampered and self.changed_total and inside >= self.tamper_threshold)))
             positions.append(np.clip(np.asarray(center) / (np.asarray(self.native_shape) - 1) * 2. - 1., -1, 1))
         return {"image": torch.from_numpy(np.stack(images))[:, None], "valid": torch.from_numpy(np.stack(valids))[:, None],
                 "mask": torch.from_numpy(np.stack(masks))[:, None].float(),

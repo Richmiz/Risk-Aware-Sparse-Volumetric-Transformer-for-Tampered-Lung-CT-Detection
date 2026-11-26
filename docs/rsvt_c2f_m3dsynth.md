@@ -1,10 +1,11 @@
 # Coarse-to-fine RSVT on M3Dsynth
 
-Updated 17 November 2026. This document describes the model and data path used
+Updated 26 November 2026. This document describes the model and data path used
 by `notebooks/01_RSVT_TRAINING.ipynb`. It replaces the 96³-token RSVT as the
 proposed model; that design remains available as a negative control
 (`configs/training/rsvt_real_ct.toml`, see [rsvt_theory.md](rsvt_theory.md)).
-Nothing here is a result: no M3Dsynth image has been downloaded or trained on yet.
+Nothing here is a model result: the store was built on 25–26 Nov 2026, and no model
+has been trained on it yet.
 
 ## Why the design changed
 
@@ -60,9 +61,10 @@ patient-disjoint partitions are used: train 488 / validation 100 / test 150 pati
    with reasons) and authentic sites (TB/TM locations). Every file has a checksum
    receipt; `verify_store` reads them back.
 
-Default caps: 200 train + 60 validation patients → 261 series, 2,993 manipulated
-samples, about 19 GB in Drive and ~29 GB of LIDC download. Test patients are not
-acquired. Change `PATIENTS_TRAIN` / `PATIENTS_VALIDATION` in the notebook.
+Default caps: 200 train + 100 validation patients → 303 series and 3,594 manipulated
+samples, of which 3,493 were eligible in the store of 26 Nov 2026 (785 removals,
+2,708 insertions). Test patients are not acquired. Change `PATIENTS_TRAIN` /
+`PATIENTS_VALIDATION` in the notebook.
 
 `src/rsvt/data/m3dsynth_dataset.py` serves volumes:
 
@@ -71,10 +73,16 @@ acquired. Change `PATIENTS_TRAIN` / `PATIENTS_VALIDATION` in the notebook.
   stored real view plus the resampled box difference (tested to be exact).
 * **Native crops**: ≈48 mm on the native voxel grid (z 16–64, y/x 32–96 voxels,
   multiples of 8), the box pasted in, no resampling.
-* **Cells**: a 12³ grid over the coarse view (≈25–37 mm cells). Cells overlapping
-  the author mask are router targets. Router candidates are the cells that pass a
+* **Cells**: a 12³ grid over the coarse view (≈25–37 mm cells). Cells holding a
+  changed voxel are router targets. Router candidates are the cells that pass a
   body-intensity test on the image alone; the label adds supervised positives but
   never candidates, in training or validation.
+* **Edit labels**: the changed voxels (manipulated ≠ real), not the author mask. On
+  removals the authors' mask is a ~33 mm cube, while the changed voxels span a cube
+  with as many slices as pixels: median 126 mm deep, and 784 of 785 eligible removals
+  change voxels outside the mask box; 2,466 of 2,708 insertions stay inside it. A label's
+  bounding box must equal the one measured while streaming. Each training run saves
+  `label_check.json`, comparing the changed voxels with the mask by operation and generator.
 
 ## Model
 
@@ -99,8 +107,9 @@ convolutions, so CUDA backward stays deterministic.
 
 Per volume: volume tamper BCE (weighted so that the 4 authentic and 12 manipulated
 volumes of a batch carry equal total weight), removal-vs-insertion BCE
-(manipulated only), crop tamper BCE, visible-nodule BCE (site crops), mask
-BCE+Dice and router BCE (positive weight 50). From epoch 4 a **tail-risk term**
+(manipulated only), crop tamper BCE (a crop is tampered when it holds at least a
+quarter of the changed voxels a crop of its shape can hold), visible-nodule BCE
+(site crops), mask BCE+Dice on the changed voxels and router BCE (positive weight 50). From epoch 4 a **tail-risk term**
 adds the empirical CVaR (α = 0.5) of the volume tamper loss within three groups:
 authentic (weight 1), removal/FB (2) and insertion/FM (1), plus the variance of
 per-generator mean loss within FB and FM (weight 0.1). Logical batches are 4
@@ -159,5 +168,6 @@ read every saved file back; if an earlier cell fails, the runtime is kept.
   CT-GAN is not an independent external test until identities are reconciled.
 * The real-series conversion is a re-implementation; archive verification marks
   any mismatching sample ineligible rather than assuming equality.
-* Author masks may not cover every changed voxel; the shortcut check reports how
-  often edits extend beyond the mask box.
+* Author masks do not cover the removal edits, so localization labels use the changed
+  voxels. Why the removal edits are a voxel cube (as many slices as pixels) is not
+  documented by the authors; `label_check.json` reports how much of each mask changed.

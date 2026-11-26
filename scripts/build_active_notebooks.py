@@ -157,7 +157,7 @@ def training_notebook():
          'manifest = session.prepare_data()\n'),
         ('dataset','8. Inspect the dataset with real CT slices',
          'Why: confirm what the model will see. Expected output: counts per partition/generator/operation and training examples '
-         'showing the authentic slice, the manipulated slice, their difference and the author mask. No test data is opened.',
+         'showing the authentic slice, the manipulated slice, their difference and the changed voxels. No test data is opened.',
          'if session.has_store():\n    dataset_overview = session.show_dataset()\n    preview_examples = session.show_previews()\n'),
         ('diagnostics','9. Pre-training checks: resolution and shortcuts',
          'Why: test the review findings on real data before spending GPU time. (a) A small CNN separates manipulated crops '
@@ -179,15 +179,17 @@ def training_notebook():
          'Why: learn from training volumes and monitor validation volumes. On a GPU runtime this trains, or continues the '
          'unfinished run; on a CPU runtime it stops here with a message. Expected output: batch progress, an updating epoch '
          'table and learning curves. The first epochs train without tail risk; the checkpoint is chosen among risk-stage epochs '
-         'by the validation loss averaged over authentic, removal and insertion volumes. Checkpoints and logs save to Drive '
-         'after every epoch.',
+         'by the validation loss averaged over authentic, removal and insertion volumes. Where a volume was edited is taken '
+         'from its changed voxels (manipulated vs real), not the author mask, which misses most of each removal. Checkpoints '
+         'and logs save to Drive after every epoch.',
          'training_summary = session.train_when_ready(diagnostics) if session.has_store() else None\n'),
         ('curves','13. Review the learning curves',
          'Why: compare training objective with validation loss and AUROCs. Falling training loss alone does not prove generalization.',
          'epoch_history = session.show_history()\n'),
         ('results','14. Inspect the selected model’s results',
          'Why: judge detection where it matters: removal (FB) and insertion (FM) against authentic scans, per generator, '
-         'router recall (did the chosen crops contain the edit?) and mask overlap. Operating points are exploratory.',
+         'router recall (did the chosen crops contain the edit?) and overlap with the changed voxels, then how those labels '
+         'compare with the author mask. Operating points are exploratory.',
          'selected_model_results = session.show_results()\n'),
         ('test','15. Understand the held-out test set',
          'Why: keep an independent final check. Test patients are not acquired or opened by this notebook.',

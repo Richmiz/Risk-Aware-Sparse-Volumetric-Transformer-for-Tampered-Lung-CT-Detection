@@ -356,7 +356,7 @@ class M3DNotebookSession:
                 axis.set_title(f"{title}\n{volume['volume_id']} z={z}", fontsize=9)
                 axis.axis("off")
             previews.append({"volume_id": volume["volume_id"], "slice_z": int(z), "split": "train"})
-        figure.suptitle("Training examples: authentic slice, manipulated slice, difference (green = author mask)")
+        figure.suptitle("Training examples: authentic slice, manipulated slice, difference (green = changed voxels)")
         figure.tight_layout()
         self._figure(figure, "dataset_preview.png")
         plt.close(figure)
@@ -573,8 +573,8 @@ class M3DNotebookSession:
                 ("Insertion (FM) vs authentic AUROC", number(m["insertion_auroc"])),
                 ("Worst-generator AUROC", number(m["worst_generator_auroc"])),
                 ("Removal vs insertion accuracy", number(m.get("removal_vs_insertion_accuracy"), True)),
-                ("Router recall@K (site among selected crops)", number(m.get("router_recall_at_k"), True)),
-                ("Mask Dice on crops containing the site", number(m.get("mask_dice_on_hit_crops")))]
+                ("Router recall@K (an edited cell among selected crops)", number(m.get("router_recall_at_k"), True)),
+                ("Edit-mask Dice on selected crops at edited cells", number(m.get("mask_dice_on_hit_crops")))]
         for name, point in m["operating_points"].items():
             rows.append((f"Removal / insertion recall at {name.replace('fpr_', '')} FPR (threshold from these authentic cases)",
                          f"{number(point['removal_recall'], True)} / {number(point['insertion_recall'], True)}"))
@@ -582,6 +582,15 @@ class M3DNotebookSession:
         self._html(table_html(["Generator", "AUROC vs authentic"], [(g, number(v)) for g, v in m["per_generator_auroc"].items()]))
         self._html("<p>Operating points are exploratory: the thresholds come from the same validation authentic volumes. "
                    "Test volumes are not acquired or opened.</p>")
+        labels_path = self.training_dir / "label_check.json"
+        if labels_path.exists():
+            groups = json.loads(labels_path.read_text(encoding="utf-8"))["groups"]
+            median = lambda g, k: number((g[k] or {}).get("median"))
+            self._html("<h4>Training labels: changed voxels compared with the author mask (medians)</h4>" + table_html(
+                ["Operation", "Volumes", "Share of mask changed", "Share of edit inside mask", "Edit depth / mask depth",
+                 "Slices changed within the edit"],
+                [(op, g["volumes"], median(g, "mask_changed"), median(g, "changed_in_mask"), median(g, "depth_ratio"),
+                  median(g, "changed_slice_fill")) for op, g in groups.items() if ":" not in op]))
         self._save_json("results_overview.json", {"validation": m, "best_epoch": summary["best_epoch"],
                                                   "test": {"status": "not_acquired_reserved", "volumes_opened": 0}})
         return summary

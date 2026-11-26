@@ -104,6 +104,19 @@ The first acquisition (24–25 Nov) accepted 160 of 3,594 manipulated samples an
 | Whole-scan mismatches | Excluded, cause open | 98 samples (39 sites) differ from the LIDC series over more than 1 M voxels. All lie where the edit cube runs off the start of the scan; 172 other samples there do not mismatch |
 | Earlier boxes and manifest | Preserved | New boxes go to `boxes_v2`; every earlier manifest is kept in `manifest_history` |
 
+## Amendment 26 November 2026 — labels from the changed voxels
+
+The second acquisition (25–26 Nov, CPU, no training) accepted 3,493 of 3,594 manipulated samples:
+785 removals and 2,708 insertions. All 3,344 label slices past the scan depth were empty.
+
+| Decision | Status | Rule |
+|---|---|---|
+| Where a volume was edited | Changed (supersedes 17 Nov) | Router targets, crop tamper labels and mask targets come from the changed voxels (manipulated ≠ real) instead of the author mask. 784 of 785 removals change voxels outside the author mask box: the mask is a ~33 mm cube, the changes span a cube with as many slices as pixels (median 126 mm deep, 3.9× the mask on 2.5 mm slices). 2,466 of 2,708 insertions stay inside their mask box. Each label's bounding box must equal the one measured while streaming |
+| Router target cells | Changed | Every 12³ cell holding a changed voxel (formerly: cells overlapping the author mask box) |
+| Crop tamper label | Changed | A crop is tampered when it holds at least a quarter of the changed voxels a crop of its shape can hold. Equal to the earlier 25% rule when the edit fits in a crop |
+| Site crop and visible-nodule label | Unchanged | Centred on the author mask box, which lay within a voxel of the centre of the changed voxels; removal 0, insertion 1 |
+| Label check | Added | Each training run saves `label_check.json`: share of the mask changed, share of the edit inside the mask, edit depth / mask depth and the share of slices changed within the edit, by operation and generator |
+
 Kelanjutan QA 13 November: run `qa_20261113T005049_219029Z` telah direview dari
 Drive. Semua 103 file metadata cocok checksum; 300 hash header sampel cocok F01;
 123 preview tercatat (110 train/13 validation), 25 titik test dikecualikan.

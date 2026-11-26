@@ -26,7 +26,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from rsvt.data import m3dsynth_store as store_mod
 from rsvt.data.m3dsynth_dataset import (AreaResampler, M3DDataset, M3DStore, VolumeCase, _rng, coarse_builder,
-                                        intensity_lut)
+                                        crop_tamper_threshold, intensity_lut)
 from rsvt.losses.endpoint_risk import dice_bce, generator_variance, grouped_tail_risk
 from rsvt.models.coarse_to_fine import CoarseToFineRSVT, compute_estimate
 from rsvt.training import coarse_to_fine as trainer
@@ -424,7 +424,7 @@ class StoreAndDataset(unittest.TestCase):
         hi = [min(a + s, n) for a, s, n in zip(start, shape, SHAPE)]
         expected[tuple(slice(l - a, h - a) for l, h, a in zip(lo, hi, start))] = full[tuple(slice(l, h) for l, h in zip(lo, hi))]
         np.testing.assert_array_equal(image, expected)
-        self.assertEqual(int(mask.sum()), 3 * 7 * 7)
+        self.assertEqual(int(mask.sum()), 5 * 9 * 9)  # the changed voxels, wider than the 3x7x7 author mask
         dataset = M3DDataset(self.store, "train", train=True, flip_probability=1., crop_mm=16., forced_sites=1, random_crops=0)
         case = dataset[dataset.rows.index(volume)]
         self.assertTrue(case.flip)
@@ -435,6 +435,50 @@ class StoreAndDataset(unittest.TestCase):
         self.assertEqual(case.cell_target.sum() > 0, True)
         self.assertEqual(len(case.forced), 1)
         self.assertEqual(case.forced[0][1], 0.)  # removal: no visible nodule
+
+    def test_labels_follow_the_changed_voxels_not_the_author_mask(self):
+        volume = next(v for v in self.manifest["volumes"] if v["volume_id"] == "cycle:rem_1")
+        edited, mask = self.fx.edits[("cycle", "rem_1")]
+        changed = np.argwhere(edited != self.fx.u16[volume["series_key"]])
+        g = 12
+
+        def cells(points, flip=False):
+            points = points.astype(float)
+            if flip:
+                points[:, 2] = SHAPE[2] - 1 - points[:, 2]
+            c = np.floor((points + .5) * g / np.asarray(SHAPE)).astype(int)
+            return sorted({(int(z) * g + int(y)) * g + int(x) for z, y, x in c})
+
+        common = dict(grid=g, crop_mm=16., forced=0, random_centers=0, rng=_rng(1), jitter_fraction=0.)
+        case = VolumeCase(self.store, volume, flip=False, **common)
+        self.assertEqual(np.flatnonzero(case.cell_target).tolist(), cells(changed))
+        # The author mask (3 slices) misses the cells reached only by the 5-slice edit.
+        self.assertLess(len(cells(np.argwhere(mask))), len(cells(changed)))
+        flipped = VolumeCase(self.store, volume, flip=True, **common)
+        self.assertEqual(np.flatnonzero(flipped.cell_target).tolist(), cells(changed, flip=True))
+        self.assertEqual(case.changed_total, 5 * 9 * 9)
+        self.assertEqual(case.tamper_threshold, .25 * 5 * 9 * 9)  # the edit fits in one crop: the earlier rule
+
+    def test_a_crop_needs_a_quarter_of_what_it_can_hold(self):
+        self.assertEqual(crop_tamper_threshold(400, (10, 20, 20), (16, 32, 32)), 100.)
+        # Edit three crop depths deep (a removal on thick slices): a centred crop holds a third.
+        self.assertAlmostEqual(crop_tamper_threshold(900, (48, 40, 40), (16, 64, 64)), .25 * 900 / 3)
+
+    def test_labels_must_match_the_edit_verified_while_streaming(self):
+        volume = dict(next(v for v in self.manifest["volumes"] if v["volume_id"] == "pix2pix:rem_3"))
+        (z0, y0, x0), hi = volume["diff_bbox"]
+        volume["diff_bbox"] = [[z0 + 1, y0, x0], hi]
+        store = M3DStore(self.fx.store, Path(self.tmp.name) / "cache_mismatch")
+        with self.assertRaisesRegex(ValueError, "verified while streaming"):
+            store.box(volume)
+        report = self.store.label_check([v for v in self.manifest["volumes"] if v["kind"] == "manipulated" and v["eligible"]])
+        removal = report["groups"]["removal"]
+        self.assertEqual(removal["volumes"], len(GENS) * 3)
+        self.assertEqual(removal["mask_changed"]["median"], 1.)
+        self.assertAlmostEqual(removal["changed_in_mask"]["median"], 147 / 405)
+        self.assertAlmostEqual(removal["depth_ratio"]["median"], 5 / 3)
+        self.assertEqual(removal["changed_slice_fill"]["median"], 1.)
+        self.assertIn("insertion:pix2pix", report["groups"])
 
     def test_validation_cases_are_unaugmented(self):
         dataset = M3DDataset(self.store, "validation", train=False)
