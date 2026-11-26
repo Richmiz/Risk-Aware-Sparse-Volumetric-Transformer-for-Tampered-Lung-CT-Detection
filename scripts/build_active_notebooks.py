@@ -83,8 +83,17 @@ def cell(kind, source, name):
     return result
 
 
+def colab_url(notebook):
+    """Open-in-Colab address of a notebook on the main branch of the public repository."""
+    return ('https://colab.research.google.com/github/' + REPOSITORY.removeprefix('https://github.com/').removesuffix('.git')
+            + '/blob/main/notebooks/' + notebook)
+
+
 def training_notebook():
     cells=[cell('markdown',
+        f'<a href="{colab_url("01_RSVT_TRAINING.ipynb")}" target="_parent">'
+        '<img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>\n','colab-link'),
+        cell('markdown',
         '# RSVT — M3Dsynth Training and Results (coarse-to-fine)\n\n'
         'This notebook prepares the **M3Dsynth** dataset (manipulated LIDC-IDRI lung CT: nodule removal and insertion by '
         'CycleGAN, pix2pix and diffusion generators), checks it, trains the coarse-to-fine RSVT and shows its results.\n\n'
@@ -214,6 +223,7 @@ def training_notebook():
     for name,title,description,code in sections:
         cells.extend([cell('markdown','## '+title+'\n\n'+description+'\n',name+'-description'),cell('code',code,name)])
     return {'nbformat':4,'nbformat_minor':5,'metadata':{
+        'colab':{'provenance':[],'include_colab_link':True},
         'kernelspec':{'display_name':'Python 3 (Colab GPU)','language':'python','name':'python3'},
         'language_info':{'name':'python'}},'cells':cells}
 

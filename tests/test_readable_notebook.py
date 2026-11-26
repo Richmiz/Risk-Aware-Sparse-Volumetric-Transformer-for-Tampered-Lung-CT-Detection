@@ -121,6 +121,14 @@ class NotebookSourceTests(unittest.TestCase):
                 sys.path[:]=before
 
 
+    def test_first_cell_opens_this_notebook_in_colab(self):
+        doc=json.loads((ROOT/'notebooks/01_RSVT_TRAINING.ipynb').read_text(encoding='utf-8'))
+        first=doc['cells'][0]
+        self.assertEqual((first['cell_type'],first['id']),('markdown','colab-link'))
+        self.assertIn('href="https://colab.research.google.com/github/Richmiz/Risk-Aware-Sparse-Volumetric-Transformer-'
+                      'for-Tampered-Lung-CT-Detection/blob/main/notebooks/01_RSVT_TRAINING.ipynb"',''.join(first['source']))
+        self.assertTrue(doc['metadata']['colab']['include_colab_link'])
+
     def test_runtime_is_released_only_after_the_save_check(self):
         doc=json.loads((ROOT/'notebooks/01_RSVT_TRAINING.ipynb').read_text(encoding='utf-8'))
         code=[(c['id'],''.join(c['source'])) for c in doc['cells'] if c['cell_type']=='code']
