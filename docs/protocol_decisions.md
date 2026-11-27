@@ -158,6 +158,7 @@ edit's crop changed no validation scan score by more than 0.0007. Validation rem
 | Run 3 | Conditional | Only if both checks pass: change only the crop network's starting weights; keep the router and the checkpoint rule; track the same validation pairs and scan AUROC per operation every epoch |
 | Checkpoint rule | Unchanged | A proposed 0.05 margin above chance was dropped: run 2's selected score (0.566) would have passed it, and `min_delta` also sets the improvement step between epochs. Whether a run is useful is judged separately, from effect sizes with patient-level intervals |
 | Paired crop loss in joint training | Deferred | Tested only if the fixed validation pairs degrade during run 3 |
+| Dataset read-back | Narrowed | `RECHECK_DATASET = False` (default, user request): section 7 skips the full read-back (58 min in run 2) when an earlier run read the same store back in full without failures; files are still checked against their manifest checksums when loaded, and the run records which full read-back it relied on |
 
 Kelanjutan QA 13 November: run `qa_20261113T005049_219029Z` telah direview dari
 Drive. Semua 103 file metadata cocok checksum; 300 hash header sampel cocok F01;

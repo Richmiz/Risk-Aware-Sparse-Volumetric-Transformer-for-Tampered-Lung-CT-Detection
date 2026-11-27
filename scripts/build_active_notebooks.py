@@ -18,6 +18,10 @@ validation score with the edit's crop added.
 27 Nov 2026: the second training run learned nothing, so `RUN` defaults to the crop
 pretraining check (section 12): pretrain the crop network, verify the transfer into the
 full model, and swap-test the scan classifier before a third run.
+
+27 Nov 2026 (later): `RECHECK_DATASET = False` (user request) skips section 7's
+hour-long full read-back of the saved dataset when an earlier run already read the
+same store back in full; every file a run opens is still checked when loaded.
 """
 
 from copy import deepcopy
@@ -112,8 +116,8 @@ def training_notebook():
         '**Just Run all; the defaults are ready.** Each run decides what to do from what is already saved in Drive:\n\n'
         '1. **First, on a CPU runtime** (cheapest): it downloads and verifies the dataset, runs the data checks and stops '
         'before training. This takes hours; keep the tab open.\n'
-        '2. **Then on a GPU runtime** (Runtime → Change runtime type → L4): it reads the saved dataset back, reuses the '
-        'checks and then does what `RUN` says. The default, `RUN = "pretrain_check"`, runs two short checks before the '
+        '2. **Then on a GPU runtime** (Runtime → Change runtime type → L4): it opens the saved dataset (read back in full '
+        'once; later runs skip that unless `RECHECK_DATASET = True`), reuses the checks and then does what `RUN` says. The default, `RUN = "pretrain_check"`, runs two short checks before the '
         'next training run (roughly 1–1½ hours, no training); `RUN = "train"` trains the model; `RUN = "crop_check"` '
         'repeats the crop learning check of 26 November.\n'
         '3. **After a disconnect**, Run all again: it continues the unfinished training run with the code it started with.\n\n'
@@ -135,7 +139,9 @@ def training_notebook():
          'before training (section 12, no training) and training (section 13). With `RUN = "train"`, '
          '`RESUME_SESSION = "auto"` continues the latest unfinished training run; changing any setting below needs a new '
          'run, so then set `RESUME_SESSION = ""`. `CODE_REF` chooses the code for a new run (a branch, tag or commit). '
-         '`LIDC_ROOT` may point to an existing LIDC-IDRI download in Drive (NBIA folder layout).',
+         '`LIDC_ROOT` may point to an existing LIDC-IDRI download in Drive (NBIA folder layout). '
+         '`RECHECK_DATASET = False` skips re-reading the whole saved dataset (about an hour) when an earlier run already '
+         'read it back in full; set it to `True` to read it all again.',
          'PROJECT = "/content/drive/MyDrive/Research/LUNG-CT-SCAN"\n'
          f'REPOSITORY = "{REPOSITORY}"\n'
          'RUN = "pretrain_check"     # a check, no training: "pretrain_check" or "crop_check"; "train" = train\n'
@@ -146,6 +152,7 @@ def training_notebook():
          'PATIENTS_VALIDATION = 100  # all publisher validation patients\n'
          'EPOCHS = 30\nLEARNING_RATE = 0.0002\nEARLY_STOPPING_PATIENCE = 8\nSEED = 13\n'
          'LIDC_ROOT = ""             # optional existing LIDC-IDRI folder in Drive\n'
+         'RECHECK_DATASET = False    # True = re-read the whole saved dataset against its checksums (about 1 hour)\n'
          'SHUTDOWN_WHEN_DONE = True  # release the runtime after the final save check, so it stops using compute units\n'),
         ('drive','2. Connect Google Drive',
          'Why: the dataset store and the results live here. Use the Google account containing Research/LUNG-CT-SCAN.',
@@ -163,7 +170,8 @@ def training_notebook():
          'session = create_session(PROJECT, CODE_ROOT, epochs=EPOCHS, learning_rate=LEARNING_RATE,\n'
          '    patience=EARLY_STOPPING_PATIENCE, seed=SEED, patients_train=PATIENTS_TRAIN,\n'
          '    patients_validation=PATIENTS_VALIDATION, generators=tuple(GENERATORS),\n'
-         '    lidc_root=LIDC_ROOT or None, resume_session=RESUME_FOLDER, code_commit=RSVT_COMMIT, run=RUN)\n'
+         '    lidc_root=LIDC_ROOT or None, resume_session=RESUME_FOLDER, code_commit=RSVT_COMMIT, run=RUN,\n'
+         '    recheck_dataset=RECHECK_DATASET)\n'
          'print("Run folder in Drive:", session.root)\n'),
         ('hardware','5. Check the actual runtime and GPU',
          'Why: a server label is not proof of a GPU. This checks what PyTorch sees. Data preparation and the data checks '
@@ -175,7 +183,9 @@ def training_notebook():
          'data_plan = session.plan_data()\n'),
         ('prepare','7. Prepare and verify M3Dsynth',
          'Why: build the dataset store, or confirm the saved one. It downloads only what the saved dataset is missing (on '
-         'the first run, everything) and otherwise reads the saved store back against its checksums. It checks free space '
+         'the first run, everything). Otherwise it reads the saved store back against its checksums, unless '
+         '`RECHECK_DATASET = False` and an earlier run already read this same store back in full; then it skips that hour '
+         'and each file is still checked against its checksum when the run loads it. It checks free space '
          'first and stops before downloading if Google Drive or the runtime disk is too small. Each manipulated slice is '
          'compared with the real LIDC slice while it streams; a sample is kept only if every change lies inside its stored '
          'box and the author mask is complete. Expected output: progress, then a checksum-verified manifest.',

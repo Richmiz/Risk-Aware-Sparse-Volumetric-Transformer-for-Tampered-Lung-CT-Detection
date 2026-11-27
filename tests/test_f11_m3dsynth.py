@@ -892,6 +892,53 @@ class DiagnosticsAndNotebook(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Not enough space, so nothing was downloaded"):
                 fresh.prepare_data()
 
+    def test_recheck_false_skips_only_after_a_full_readback_of_the_same_store(self):
+        from rsvt.training.m3d_notebook import M3DNotebookSession
+        root = Path(self.tmp.name)
+        runs = root / "recheck_project/outputs/rsvt_training"
+        runs.mkdir(parents=True)
+        repo = Path(__file__).resolve().parents[1]
+
+        def session(recheck):
+            return M3DNotebookSession(root / "recheck_project", repo, configuration=small_config(), epochs=2,
+                                      learning_rate=1e-3, patience=0, seed=13, patients_train=2, patients_validation=1,
+                                      generators=GENS, metadata_dir=self.fx.meta_dir, lidc_root=self.fx.lidc,
+                                      enforce_drive=False, display_enabled=False, store_root=self.fx.store,
+                                      cache_root=root / "recheck_cache", recheck_dataset=recheck)
+
+        record = lambda s: json.loads((s.root / "dataset_verification.json").read_text(encoding="utf-8"))
+        with mock.patch.object(store_mod, "verify_store", wraps=store_mod.verify_store) as readback:
+            first = session(False)  # nothing earlier to rely on, so it reads everything back
+            first.prepare_data()
+            self.assertEqual(readback.call_count, 1)
+            full = record(first)
+            self.assertEqual((full["full_readback"], full["ok"]), (True, True))
+            # Newer runs that must not count: another manifest, failures, another store folder.
+            manifest = store_mod.sha256_path(self.fx.store / "manifest.json")
+            for name, store, result in (("c2f_99990103T000000_000000Z", self.fx.store, {"manifest_sha256": "0" * 64}),
+                                        ("c2f_99990102T000000_000000Z", self.fx.store, {"ok": False, "failures": ["x"]}),
+                                        ("c2f_99990101T000000_000000Z", root / "elsewhere", {})):
+                (runs / name).mkdir()
+                store_mod.write_json(runs / name / "notebook_session.json", {"store": str(store)})
+                store_mod.write_json(runs / name / "dataset_verification.json",
+                           {"manifest_sha256": manifest, "ok": True, "failures": [], "files_checked": 5, **result})
+            skipped = session(False)
+            self.assertEqual(skipped.prepare_data()["schema_version"], "m3dsynth_store_v1")
+            self.assertEqual(readback.call_count, 1)  # not read back again
+            reused = record(skipped)
+            self.assertEqual((reused["full_readback"], reused["files_checked"]), (False, 0))
+            self.assertEqual(reused["reused_full_readback"]["run"], first.root.name)
+            self.assertEqual(reused["reused_full_readback"]["files_checked"], full["files_checked"])
+            again = session(False)  # a skip never vouches for a later skip: it points at the full read-back
+            again.prepare_data()
+            self.assertEqual(record(again)["reused_full_readback"]["run"], first.root.name)
+            session(True).prepare_data()  # RECHECK_DATASET = True always reads everything back
+            self.assertEqual(readback.call_count, 2)
+        skipped.verify_saved()
+        self.assertIn("full read-back skipped", (skipped.root / "run_overview.md").read_text(encoding="utf-8"))
+        first.verify_saved()
+        self.assertIn("read back against its checksum in this run", (first.root / "run_overview.md").read_text(encoding="utf-8"))
+
     def test_notebook_session_end_to_end_in_fixture_mode(self):
         from rsvt.training.m3d_notebook import M3DNotebookSession
         root = Path(self.tmp.name)

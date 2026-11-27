@@ -41,10 +41,13 @@ class M3DNotebookSession:
     def __init__(self, project, code_root, *, epochs=30, learning_rate=2e-4, patience=8, seed=13,
                  patients_train=200, patients_validation=100, generators=("cycle", "pix2pix", "diffusion"),
                  resume_session="", configuration=None, store_root=None, cache_root=None, work_root=None,
-                 lidc_root=None, metadata_dir=None, enforce_drive=True, display_enabled=True, code_commit=None, run="train"):
+                 lidc_root=None, metadata_dir=None, enforce_drive=True, display_enabled=True, code_commit=None, run="train",
+                 recheck_dataset=True):
         if run not in RUNS:
             raise ValueError("RUN must be one of: " + ", ".join(f'"{r}"' for r in RUNS))
         self.run = run
+        # False: skip the full read-back of a saved store that an earlier run already read back in full.
+        self.recheck_dataset = recheck_dataset
         self.project, self.code_root = Path(project).resolve(), Path(code_root).resolve()
         if enforce_drive and (platform.system() != "Linux"
                               or not self.project.is_relative_to(Path("/content/drive/MyDrive").resolve())):
@@ -238,7 +241,11 @@ class M3DNotebookSession:
                        f"{' — downloading what is missing.' if download else ' — verifying the saved files.'}</p>")
         if not download:
             if manifest_path.exists():
-                self._html("<p><b>Existing verified store found.</b> Reading it back against its checksums.</p>")
+                earlier = None if self.recheck_dataset else self._earlier_full_check()
+                if earlier:
+                    return self._reuse_dataset_check(earlier)
+                self._html("<p><b>Existing verified store found.</b> Reading it back against its checksums"
+                           f"{'' if self.recheck_dataset else ' (no earlier run read this store back in full)'}.</p>")
                 return self.verify_dataset()
             self._html("<p><b>No M3Dsynth store yet.</b> Nothing was downloaded.</p>")
             return None
@@ -297,9 +304,44 @@ class M3DNotebookSession:
         manifest = json.loads((self.store_root / "manifest.json").read_text(encoding="utf-8"))
         check = store_mod.verify_store(self.store_root, manifest)
         self._save_json("dataset_verification.json", {"manifest_sha256": sha256_path(self.store_root / "manifest.json"),
-                                                      **check, "counts": manifest["counts"]})
+                                                      "full_readback": True, **check, "counts": manifest["counts"]})
         if not check["ok"]:
             raise OSError("Store readback failed for: " + ", ".join(check["failures"][:10]))
+        return manifest
+
+    def _earlier_full_check(self):
+        """The latest other run that read this same store back in full without failures, or None.
+
+        Same store folder and the same manifest checksum; records that themselves skipped the
+        read-back never count, so every skip points at a real full read-back.
+        """
+        digest = sha256_path(self.store_root / "manifest.json")
+        for path in sorted(self.root.parent.glob("c2f_*/dataset_verification.json"), reverse=True):
+            if path.parent == self.root:
+                continue
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+                store = json.loads((path.parent / "notebook_session.json").read_text(encoding="utf-8")).get("store")
+            except (OSError, ValueError):
+                continue
+            if (store == str(self.store_root) and record.get("manifest_sha256") == digest
+                    and record.get("full_readback", True) and record.get("ok") is True
+                    and not record.get("failures") and record.get("files_checked")):
+                return {"run": path.parent.name, "record_sha256": sha256_path(path), "files_checked": record["files_checked"]}
+        return None
+
+    def _reuse_dataset_check(self, earlier):
+        """RECHECK_DATASET = False: rely on the earlier full read-back and on the per-file checks at load time."""
+        manifest_path = self.store_root / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self._html(f"<p><b>Existing verified store found.</b> Not reading it all back again (RECHECK_DATASET = False): "
+                   f"run {escape(earlier['run'])} read all {earlier['files_checked']} files back against this same "
+                   "manifest. Every file this run opens is still checked against its checksum when it is loaded.</p>")
+        self._save_json("dataset_verification.json", {
+            "manifest_sha256": sha256_path(manifest_path), "full_readback": False, "files_checked": 0,
+            "reused_full_readback": earlier,
+            "per_file_check": "each file this run opens is compared with its manifest checksum when it is loaded",
+            "counts": manifest["counts"]})
         return manifest
 
     def has_store(self):
@@ -816,6 +858,13 @@ class M3DNotebookSession:
     def verify_saved(self):
         summary = self.training_dir / "summary.json"
         text = f"# RSVT coarse-to-fine session\n\nOutput: `{self.root}`\n\nStore: `{self.store_root}`\n\n"
+        verification = self.root / "dataset_verification.json"
+        if verification.exists():
+            record = json.loads(verification.read_text(encoding="utf-8"))
+            text += ("Dataset: every stored file was read back against its checksum in this run.\n\n"
+                     if record.get("full_readback", True) else
+                     f"Dataset: full read-back skipped (RECHECK_DATASET = False); run {record['reused_full_readback']['run']} "
+                     "read the same manifest back in full, and each file opened here was checked when loaded.\n\n")
         if summary.exists():
             m = json.loads(summary.read_text(encoding="utf-8"))["validation_metrics"]
             text += (f"Validation tamper AUROC {m['tamper_auroc']}; removal AUROC {m['removal_auroc']}; "

@@ -139,6 +139,8 @@ class NotebookSourceTests(unittest.TestCase):
         cells=dict(code)
         self.assertIn('RUN = "pretrain_check"',cells['settings'])  # 27 Nov: the checks come before a third run
         self.assertIn('run=RUN',cells['session'])
+        self.assertIn('RECHECK_DATASET = False',cells['settings'])  # 27 Nov: skip the hour-long full dataset read-back
+        self.assertIn('recheck_dataset=RECHECK_DATASET',cells['session'])
         self.assertIn('session.run_check()',cells['crop_check'])
         titles=[''.join(c['source']).splitlines()[0] for c in doc['cells'] if c['id'].endswith('-description')]
         self.assertEqual([int(t.split('.')[0].removeprefix('## ')) for t in titles],list(range(1,len(titles)+1)))

@@ -344,7 +344,12 @@ on a sample of 30 series this gave the audited UID every time.
 
 Section 7 downloads only what the saved store is missing for the current
 selection, after checking free space in Google Drive and on the runtime disk;
-otherwise it reads the store back against its checksums. Section 9 runs the data
+otherwise it reads the store back against its checksums. With `RECHECK_DATASET =
+False` (the default since 27 Nov) it skips that full read-back, about an hour on an
+L4, when an earlier run already read the same store (same folder and manifest
+checksum) back without failures; the run's `dataset_verification.json` names that
+run. Every real series, coarse view and edit box is still compared with its
+manifest checksum when a run first loads it. Section 9 runs the data
 checks once per store (saved beside it) and holds training back if most samples
 failed archive verification or whole-scan statistics separate the classes.
 Sections 12 and 13 run only on a GPU; on a CPU runtime they stop with a message, so
