@@ -143,6 +143,22 @@ image (0.69 for both), which it fitted by memorising anatomy. Details in [rsvt_c
 | Site-crop diagnostic | Added | Each validation scan is also scored with one extra crop at the author manipulation centre (manipulated) or one of its series' real TB/TM sites (authentic); reports scan AUROC with that crop and crop AUROC on it alone. Diagnostic only: never used for selection or training; router-only scores unchanged |
 | Next GPU run | Changed | `RUN = "train"` is the notebook default again |
 
+## Amendment 27 November 2026 — second training run and the crop pretraining check
+
+The second L4 run (commit `4b585c8`, residual crops, AUROC selection) learned nothing. The volume tamper loss stayed
+at chance on the training scans for all 25 epochs, the crop network matched a constant prediction, and adding the
+edit's crop changed no validation scan score by more than 0.0007. Validation removal AUROC 0.626 (95% interval
+0.554–0.692, resampling patients), insertion 0.506 (0.432–0.580). Details in [rsvt_c2f_m3dsynth.md](rsvt_c2f_m3dsynth.md).
+
+| Decision | Status | Rule |
+|---|---|---|
+| Next GPU run | Changed | `RUN = "pretrain_check"` (notebook default): two short checks, no full training |
+| Crop pretraining | Added | The crop check's recipe on the crops the full model cuts; weights saved with a checksum receipt; transfer into a fresh full model verified on the same validation crops and through the model's data path (tolerance 1e-3) |
+| Scan-classifier swap test | Added | Crop network frozen; the rest trained for 300 logical batches without tail risk; each validation edit scored with one slot swapped between the edited crop and the same crop of the unedited scan (identical context, 16 crops, other edited cells excluded); paired change per operation with patient-level intervals. The unedited crop is a diagnostic reference only |
+| Run 3 | Conditional | Only if both checks pass: change only the crop network's starting weights; keep the router and the checkpoint rule; track the same validation pairs and scan AUROC per operation every epoch |
+| Checkpoint rule | Unchanged | A proposed 0.05 margin above chance was dropped: run 2's selected score (0.566) would have passed it, and `min_delta` also sets the improvement step between epochs. Whether a run is useful is judged separately, from effect sizes with patient-level intervals |
+| Paired crop loss in joint training | Deferred | Tested only if the fixed validation pairs degrade during run 3 |
+
 Kelanjutan QA 13 November: run `qa_20261113T005049_219029Z` telah direview dari
 Drive. Semua 103 file metadata cocok checksum; 300 hash header sampel cocok F01;
 123 preview tercatat (110 train/13 validation), 25 titik test dikecualikan.

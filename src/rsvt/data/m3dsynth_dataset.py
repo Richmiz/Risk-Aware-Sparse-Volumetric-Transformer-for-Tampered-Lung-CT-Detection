@@ -105,6 +105,12 @@ def _rng(*parts):
     return np.random.default_rng(int.from_bytes(hashlib.sha256(json.dumps(parts).encode()).digest()[:8], "little"))
 
 
+def site_center_native(volume):
+    """Centre of the authors' mask box in native voxels: where the model's site crop is cut."""
+    lo, hi = (np.asarray(v, dtype=float) for v in volume["mask_bbox"])
+    return (lo + hi - 1.) / 2.
+
+
 def changed_bbox(changed, start):
     """Bounding box [lo, hi) of the changed voxels in scan coordinates, as streaming records it."""
     points = np.argwhere(changed)
@@ -347,9 +353,7 @@ class VolumeCase:
                 self.tamper_threshold = crop_tamper_threshold(self.changed_total, extent, self.crop_shape)
             # The site crop stays at the authors' declared site (the centre of their mask box);
             # on the first full store it lay within a voxel of the centre of the changed voxels.
-            lo, hi = (np.asarray(v, dtype=float) for v in volume["mask_bbox"])
-            lo_v, hi_v = self.to_view(lo), self.to_view(hi - 1)
-            self.site_center = (np.minimum(lo_v, hi_v) + np.maximum(lo_v, hi_v)) / 2.
+            self.site_center = self.to_view(site_center_native(volume))
         # Cells supervised by the router loss: every true cell is a positive even when it
         # fails the body test, but the label never adds selection candidates (that leaked
         # the answer into validation routing; review of 24 Nov 2026).
@@ -394,12 +398,19 @@ class VolumeCase:
             out[..., 2] = self.native_shape[2] - 1 - out[..., 2]
         return out
 
-    def crops(self, centers_view):
-        """K crops at view-space centres -> tensors and per-crop supervision."""
+    def crops(self, centers_view, source=None):
+        """K crops at view-space centres -> tensors and per-crop supervision.
+
+        `source` cuts the same places from another scan of this series (the unedited
+        original of an edit); only the crop pretraining check uses it, never training.
+        """
+        source = self.volume if source is None else source
+        if source["series_key"] != self.volume["series_key"]:
+            raise ValueError("A crop source must be a scan of the same series")
         images, valids, masks, tamper, positions = [], [], [], [], []
         for center in centers_view:
             native = self.to_view(center)  # the x-flip is its own inverse
-            image, valid, edit = self.store.crop(self.volume, native, self.crop_shape)
+            image, valid, edit = self.store.crop(source, native, self.crop_shape)
             if self.flip:
                 image, valid, edit = image[..., ::-1], valid[..., ::-1], edit[..., ::-1]
             images.append(np.ascontiguousarray(image))

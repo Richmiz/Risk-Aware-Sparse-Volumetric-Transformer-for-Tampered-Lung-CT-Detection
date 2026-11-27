@@ -33,8 +33,8 @@ STORE_RELATIVE = "datasets/m3dsynth_store"
 RUNS_RELATIVE = "outputs/rsvt_training"
 METADATA_RELATIVE = "data/raw/m3dsynth/metadata"
 UID_MAP_RELATIVE = "reports/supplementary/data_label_audit_20261111/metadata_review_v2/m3dsynth_source_groups.csv"
-# What a GPU runtime does: train the model, or only check that its crop network can learn the edit.
-RUNS = ("train", "crop_check")
+# What a GPU runtime does: train the model, or run one of the checks before training (no training).
+RUNS = ("train", "crop_check", "pretrain_check")
 
 
 class M3DNotebookSession:
@@ -526,11 +526,20 @@ class M3DNotebookSession:
             message = json.dumps(event, default=str)[:200]
         self._handles["status"].update(HTML("<p><b>" + escape(message) + "</b></p>"))
 
-    # ------------------------------------------------------------------ crop learning check
+    # ------------------------------------------------------------------ checks before training
+    def run_check(self, **settings):
+        """Section 12: the check that `RUN` names, or nothing when RUN = "train"."""
+        if self.run == "crop_check":
+            return self.run_crop_check(**settings)
+        if self.run == "pretrain_check":
+            return self.run_pretrain_check(**settings)
+        self._html('<p>No check in this run (RUN = "train"); training follows in the next section.</p>')
+        return None
+
     def run_crop_check(self, *, device=None, **settings):
         """With RUN = "crop_check": train the fine crop network alone on crops that contain the edit."""
         if self.run != "crop_check":
-            self._html('<p>Crop learning check skipped (RUN = "train").</p>')
+            self._html(f'<p>Crop learning check skipped (RUN = "{self.run}").</p>')
             return None
         device = device or ("cuda" if torch.cuda.is_available() else None)
         if device is None:
@@ -600,10 +609,109 @@ class M3DNotebookSession:
         plt.close(figure)
         return rows
 
+    def run_pretrain_check(self, *, device=None, **settings):
+        """With RUN = "pretrain_check": pretrain the crop network, verify the transfer, swap-test the scan classifier."""
+        if self.run != "pretrain_check":
+            self._html(f'<p>Crop pretraining check skipped (RUN = "{self.run}").</p>')
+            return None
+        device = device or ("cuda" if torch.cuda.is_available() else None)
+        if device is None:
+            self._html("<p><b>No GPU in this runtime, so the crop pretraining check waits.</b> Switch to a GPU runtime "
+                       "(Runtime → Change runtime type → L4) and Run all.</p>")
+            return None
+        from rsvt.experiments import m3d_pretrain_check
+        if self.display_enabled:
+            from IPython.display import HTML, display
+            self._handles["status"] = display(HTML("<p>Cutting crop pairs…</p>"), display_id=True)
+        folder = self.root / "pretrain_check"
+        result = m3d_pretrain_check.pretrain_check(self._store(), self.config, folder, device=device,
+                                                   progress=self._progress_printer("[pretrain check]"), **settings)
+        for name in ("pretrain_check.json", m3d_pretrain_check.WEIGHTS, m3d_pretrain_check.WEIGHTS + ".json"):
+            self.artifacts["pretrain_check/" + name] = {"sha256": sha256_path(folder / name)}
+        self.show_pretrain_check(result)
+        return result
+
+    def show_pretrain_check(self, result):
+        import matplotlib.pyplot as plt
+        percent = lambda v: "—" if v is None else f"{100 * v:.0f}%"
+        interval = lambda ci: "" if not ci else f" [{100 * ci[0]:.0f}–{100 * ci[1]:.0f}]"
+        number = lambda v: "—" if v is None else f"{v:.3g}"
+        operations = ("removal", "insertion")
+        pre, transfer, swap = result["pretraining"], result["transfer"], result["swap_test"]
+        final = pre["final"]
+        rows = [("Pairs: train / validation (patients)",
+                 f"{sum(result['pairs']['train'].values())} / {sum(result['pairs']['validation'].values())} "
+                 f"({result['pairs']['train_patients']} / {result['pairs']['validation_patients']})"),
+                ("1. Pretrained crop network, unseen patients: pairs ordered correctly (removal / insertion)",
+                 " / ".join(percent((final.get(op) or {}).get("paired_accuracy")) + interval(pre["paired_accuracy_ci95"].get(op))
+                            for op in operations) + " — " + pre["verdict"].replace("_", " ")),
+                ("1. Crop AUROC on those pairs (removal / insertion)",
+                 " / ".join(number((final.get(op) or {}).get("crop_auroc")) for op in operations)),
+                ("1. Same crops scored inside the full model: largest score change",
+                 f"{number(transfer['loaded_weights']['max_logit_difference'])} — "
+                 + ("match" if transfer["loaded_weights"]["match"] else "MISMATCH")),
+                ("1. Crops cut by the model's own data path: largest image / score change",
+                 f"{number(transfer['model_data_path']['max_image_difference'])} / "
+                 f"{number(transfer['model_data_path']['max_logit_difference'])} — "
+                 + ("match" if transfer["model_data_path"]["match"] else "MISMATCH"))]
+        if "skipped" in swap:
+            rows.append(("2. Swap test", "skipped: " + swap["skipped"]))
+        else:
+            after, before = swap["after_training"], swap["before_training"]
+            share = lambda metrics, key: " / ".join(
+                percent((metrics.get(op) or {}).get(key, {}).get("paired_accuracy"))
+                + interval((metrics.get(op) or {}).get(key, {}).get("paired_accuracy_ci95")) for op in operations)
+            rows += [(f"2. After {swap['fusion_steps']} training steps: scan score higher with the edited crop "
+                      "(removal / insertion)", share(after, "scan_logit")),
+                     ("2. Yardstick without fusion: largest crop score higher (removal / insertion)",
+                      share(after, "max_crop_logit")),
+                     ("2. Mean change in the scan logit (removal / insertion)",
+                      " / ".join(number((after.get(op) or {}).get("scan_logit", {}).get("mean_change")) for op in operations)),
+                     ("2. Before that training (untrained scan classifier)", share(before, "scan_logit")),
+                     ("2. Scans where another chosen crop also held the edit",
+                      f"{(after.get('all') or {}).get('scans_with_edit_in_other_crops')} of {(after.get('all') or {}).get('scans')}")]
+        rows.append(("Conclusion", result["interpretation"]))
+        self._html("<h3>Crop pretraining and swap test (train/validation only)</h3>"
+                   + table_html(["Check", "Result"], rows)
+                   + "<p>50% = chance; brackets are 95% intervals that resample whole patients. Check 1 trains the crop "
+                     "network alone on each edited crop and the same crop of its unedited scan, then loads it into the "
+                     "full model. Check 2 freezes it, trains the rest briefly, and scores each unseen edited scan twice "
+                     "with one crop swapped between edited and unedited.</p>")
+        figure, axes = plt.subplots(1, 3, figsize=(14, 3.6))
+        curve = pre["curve"]
+        axes[0].plot([p["step"] for p in curve[1:]], [p["train_loss"] for p in curve[1:]], marker="o")
+        axes[0].axhline(np.log(2), color="grey", linestyle=":", label="chance")
+        axes[0].set(title="1. Pretraining loss (BCE)", xlabel="Step")
+        for op in operations:
+            axes[1].plot([p["step"] for p in curve], [np.nan if not p["validation"].get(op) else
+                                                      p["validation"][op]["paired_accuracy"] for p in curve],
+                         marker="o", label=f"{op}, unseen patients")
+        axes[1].axhline(.5, color="grey", linestyle=":")
+        axes[1].set(title="1. Pairs ordered correctly", xlabel="Step", ylim=(0, 1))
+        if "skipped" not in swap:
+            labels = [("scan_logit", "scan score"), ("max_crop_logit", "largest crop score")]
+            for j, (key, label) in enumerate(labels):
+                values = [(swap["after_training"].get(op) or {}).get(key, {}) for op in operations]
+                means = [v.get("paired_accuracy", np.nan) for v in values]
+                errors = np.array([[m - v["paired_accuracy_ci95"][0], v["paired_accuracy_ci95"][1] - m] if v else [0, 0]
+                                   for m, v in zip(means, values)]).T
+                axes[2].bar(np.arange(2) + (j - .5) * .35, means, .35, yerr=errors, capsize=3, label=label)
+            axes[2].set_xticks(range(2), operations)
+            axes[2].axhline(.5, color="grey", linestyle=":")
+        axes[2].set(title="2. Higher with the edited crop", ylim=(0, 1))
+        for axis in axes:
+            axis.grid(alpha=.2)
+            if axis.get_legend_handles_labels()[0]:
+                axis.legend(fontsize=8)
+        figure.tight_layout()
+        self._figure(figure, "pretrain_check.png")
+        plt.close(figure)
+        return rows
+
     def train_when_ready(self, diagnostics=None):
         """Train (or resume) on a GPU unless a data check blocks it; on a CPU runtime explain the next step."""
         if self.run != "train":
-            self._html('<p><b>No training in this run</b> (RUN = "crop_check"). Set RUN = "train" in section 1 to '
+            self._html(f'<p><b>No training in this run</b> (RUN = "{self.run}"). Set RUN = "train" in section 1 to '
                        "train the model.</p>")
             return None
         if self.config["training"]["device"] == "cuda" and not torch.cuda.is_available():
@@ -720,6 +828,10 @@ class M3DNotebookSession:
         check = self.root / "crop_check" / "crop_check.json"
         if check.exists():
             text += "Crop learning check: " + json.loads(check.read_text(encoding="utf-8"))["interpretation"] + "\n\n"
+        pretrain = self.root / "pretrain_check" / "pretrain_check.json"
+        if pretrain.exists():
+            text += ("Crop pretraining check: " + json.loads(pretrain.read_text(encoding="utf-8"))["interpretation"]
+                     + "\n\n")
         text += "Test volumes acquired/opened: 0.\n"
         (self.root / "run_overview.md").write_text(text, encoding="utf-8")
         if (self.root / "run_overview.md").read_text(encoding="utf-8") != text:

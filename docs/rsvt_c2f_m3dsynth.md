@@ -247,11 +247,93 @@ The first training run fed the crop network the windowed image, which explains m
 of why its crop loss stayed at chance. The model now reads residual crops
 (`fine_input = "residual"`).
 
+## Second training run (26 November 2026)
+
+L4 GPU, commit `4b585c8` (residual crops, AUROC checkpoint selection, the site-crop
+diagnostic), same data as the first run. Early stopping ended it after epoch 25
+(about 3½ hours of training); the selected checkpoint is epoch 17. No test volume
+was opened. Intervals resample whole patients (100 validation patients).
+
+| Measure (validation unless stated) | Value |
+|---|---|
+| Removal AUROC (95% interval) | 0.626 (0.554–0.692) |
+| Insertion AUROC (95% interval) | 0.506 (0.432–0.580) |
+| Tamper AUROC / selection AUROC | 0.531 / 0.566 |
+| Router recall@16, removal / insertion | 53% / 25% |
+| Scan AUROC with the edit's crop added, removal / insertion | 0.628 / 0.507 |
+| That crop alone, crop AUROC, removal / insertion | 0.448 / 0.354 |
+| Training volume tamper loss, every epoch | 0.69–0.70 |
+
+* The model did not fit its own training scans: the volume tamper loss stayed at
+  chance for all 1,250 optimizer steps, and every validation scan got a tamper
+  probability between 0.53 and 0.57.
+* The crop tamper loss rose from 0.25 to 0.41. That is the entropy of the crop label
+  mix: about 6% of training crops held an edit at the start and about 14% at the end,
+  as the router found more edits. A crop network that ignores its input scores
+  exactly this, so 0.69 was the wrong yardstick for this loss. Its crop scores ranked
+  inserted nodules below real ones and stayed at crop AUROC 0.37–0.39 from epoch 1
+  to epoch 25.
+* Adding the edit's crop changed no scan score by more than 0.0007, for either
+  operation, including the 146 removals the router missed. Routing was not what
+  limited this run.
+* The removal AUROC above chance was already 0.61 after epoch 1; which branch
+  produces it is unknown.
+* The selection AUROC swung between 0.46 and 0.57 from epoch to epoch without a
+  trend; epoch 17 is the highest of those swings.
+* The router fitted the training scans (loss 2.85 → 0.39) while its validation recall
+  fell (removal 68% at epoch 8 → 40%, insertion 34% → 20%).
+* Why the crop network learned in the crop check but not here: the check gave it
+  2,000 steps at a peak learning rate of 1e-3, balanced pairs of edited and unedited
+  crops from the same place, and only the crop loss. This run gave it 1,250 steps at
+  2e-4, one of six loss terms, 6–14% edited crops, and unedited crops from other
+  places and scans. Even in the check, the loss did not move for 400 steps and crop
+  AUROC passed 0.7 only around step 1,000.
+
+## Crop pretraining check
+
+`src/rsvt/experiments/m3d_pretrain_check.py` (`RUN = "pretrain_check"`, the notebook
+default since 27 Nov) runs two short checks before a third training run, agreed
+after review of the second run:
+
+1. **Pretrain and verify the transfer.** The model's crop network is trained alone
+   with the crop check's recipe (2,000 steps, 8 pairs per step, peak learning rate
+   1e-3 with warmup then cosine, shift and flip shared by both crops of a pair, up to
+   192 pairs per operation from training patients, round-robin over generators). The
+   crops are the ones the full model cuts: each scan's own ~48 mm shape, centred on
+   the author mask box like the model's site crop, with the residual computed inside
+   the network. Shift margins are even, so the larger crop rounds like the model's.
+   Up to 96 validation pairs per operation from unseen patients are scored every 200
+   steps. The weights are saved (`fine_branch.pt` with a checksum receipt) and loaded
+   into a fresh full model, and the same validation crops are scored again before any
+   optimizer step. The crops are then cut again through the model's data path
+   (`VolumeCase.crops`) and compared voxel for voxel. Scores must agree within 1e-3;
+   a mismatch, such as a residual applied twice, is an implementation error.
+2. **Swap test of the scan classifier.** If the transfer matches and pretraining
+   learned the edit, the crop network is frozen and the rest of the model (coarse
+   branch and router, fusion, heads) trains for 300 logical batches on training
+   patients, with the full model's data and objective and without tail risk. Each
+   validation edit is then scored twice with the edited scan's coarse view and the
+   same 16 crops: 15 from the router, excluding cells that hold changed voxels, and
+   one slot holding either the edited crop or the same crop of the unedited scan.
+   The result is the paired change in the scan logit, per operation, with 95%
+   intervals that resample whole patients. The largest crop logit among the 16 is a
+   yardstick that needs no fusion, and the same test before that training is a
+   reference. The unedited crop is used only in this test, never in training.
+
+The conclusion follows the agreed decision rule. A transfer mismatch means fixing
+the implementation first; no learning in pretraining means revisiting the crop
+recipe. If the scan score responds for both operations, run 3 changes only the crop
+network's starting weights (router and checkpoint rule unchanged) and should track
+the same validation pairs every epoch. If the crops carry the edit but the scan
+score does not respond, how the model combines crop evidence comes before another
+full run.
+
 ## Running it
 
 Open `notebooks/01_RSVT_TRAINING.ipynb` in Colab from GitHub and use Run all. On a
-GPU, `RUN` chooses what the run does: `"train"` (the default) trains in section 13;
-`"crop_check"` runs the crop learning check in section 12 and does not train.
+GPU, `RUN` chooses what the run does: `"pretrain_check"` (the default since 27 Nov)
+and `"crop_check"` run a check in section 12 and do not train; `"train"` trains in
+section 13.
 With `RUN = "train"`, section 3 continues the latest unfinished training
 run when there is one (`RESUME_SESSION = "auto"`), checking out the commit that
 run started with; otherwise it clones the public repository at `CODE_REF`. Section
@@ -278,10 +360,10 @@ section 17 has read every saved file back; if an earlier cell fails, the runtime
   CT-GAN is not an independent external test until identities are reconciled.
 * The real-series conversion is a re-implementation; archive verification marks
   any mismatching sample ineligible rather than assuming equality.
-* The crop learning check places every crop on the edit. In the first training run
-  the router's 16 crops held the edit for 37% of manipulated validation scans, so
-  routing, not the crop stage, may now limit scan-level detection; the site-crop
-  diagnostic measures this.
+* The crop checks place a crop on the edit. The router's 16 crops held the edit for
+  37% of manipulated validation scans in the first run and 31% in the second, but in
+  the second run adding the edit's crop changed nothing, so the crop stage, not
+  routing, limited it. Routing becomes the question once the crops carry the edit.
 * Author masks do not cover the removal edits, so localization labels use the changed
   voxels. Why the removal edits are a voxel cube (as many slices as pixels) is not
   documented by the authors; `label_check.json` reports how much of each mask changed.

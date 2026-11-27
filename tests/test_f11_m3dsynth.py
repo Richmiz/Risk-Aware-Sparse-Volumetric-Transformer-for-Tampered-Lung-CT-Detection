@@ -1065,6 +1065,182 @@ class CropCheck(unittest.TestCase):
         self.assertEqual(json.loads((session.root / "notebook_session.json").read_text(encoding="utf-8"))["run"], "crop_check")
 
 
+class PretrainCheck(unittest.TestCase):
+    """Crop pretraining on the model's own crops, the transfer check and the crop-swap test (27 Nov 2026)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = TemporaryDirectory(ignore_cleanup_errors=True)
+        cls.fx = Fixture(cls.tmp.name)
+        cls.fx.acquire()
+        cls.store = M3DStore(cls.fx.store, Path(cls.tmp.name) / "cache")
+
+    @classmethod
+    def tearDownClass(cls):
+        import gc
+        gc.collect()
+        cls.tmp.cleanup()
+
+    def tiny(self, **changes):
+        settings = dict(device="cpu", per_operation_train=0, per_operation_validation=0, steps=2, batch_pairs=2,
+                        eval_every=1, fusion_steps=2, resamples=50)
+        settings.update(changes)
+        return settings
+
+    def pairs(self, split="validation"):
+        from rsvt.experiments.m3d_crop_check import select_pairs
+        from rsvt.experiments.m3d_pretrain_check import site_pairs
+        return site_pairs(self.store, select_pairs(self.store, split, GENS, 0, 13), small_config()["data"]["crop_mm"])
+
+    def test_site_pairs_are_the_models_site_crop_and_its_unedited_twin(self):
+        from rsvt.experiments.m3d_pretrain_check import _core, unedited
+        data = self.pairs()
+        self.assertEqual(len(data["items"]), 4)
+        for volume, item in zip(data["volumes"], data["items"]):
+            self.assertTrue(all(m % 2 == 0 for m in item["margin"]))  # even: the big crop rounds like the model's
+            case = VolumeCase(self.store, volume, flip=False, grid=12, crop_mm=16., forced=0, random_centers=0,
+                              rng=_rng(0), jitter_fraction=0.)
+            self.assertEqual(item["shape"], case.crop_shape)
+            edited = case.crops([case.site_center])
+            original = case.crops([case.site_center], source=unedited(volume))
+            torch.testing.assert_close(edited["image"][0], _core(item, "fake"), rtol=0, atol=0)
+            torch.testing.assert_close(original["image"][0], _core(item, "real"), rtol=0, atol=0)
+            self.assertEqual(float(original["tamper"][0]), 0.)
+            differs = edited["image"] != original["image"]
+            self.assertTrue(bool(differs.any()))
+            self.assertFalse(bool((differs & ~edited["mask"].bool()).any()))  # only the changed voxels differ
+        with self.assertRaisesRegex(ValueError, "same series"):
+            case.crops([case.site_center], source={"kind": "authentic", "series_key": "other"})
+
+    def test_transfer_check_matches_and_catches_a_wrong_or_doubled_residual(self):
+        from rsvt.experiments import m3d_pretrain_check as check
+        from rsvt.models import coarse_to_fine as model_mod
+        config = small_config()
+        train, validation = self.pairs("train"), self.pairs()
+        kwargs = check.fine_kwargs(config["model"])
+        self.assertEqual(kwargs["input"], "residual")  # the model default reaches pretraining
+        branch, curve, reference = check.pretrain(train, validation, steps=2, batch_pairs=2, lr=1e-3, seed=13,
+                                                  device="cpu", model_kwargs=kwargs, eval_every=1)
+        self.assertEqual([p["step"] for p in curve], [0, 1, 2])
+        state = {k: v.detach().clone() for k, v in branch.state_dict().items()}
+        common = dict(grid=12, crop_mm=16., tolerance=1e-4)
+        result = check.transfer_check(state, config["model"], self.store, validation, reference, "cpu", **common)
+        self.assertTrue(result["match"])
+        self.assertEqual(result["model_data_path"]["max_image_difference"], 0.)
+        image_input = dict(config["model"], fine_input="image")  # residual missing in the full model
+        self.assertFalse(check.transfer_check(state, image_input, self.store, validation, reference, "cpu",
+                                              **common)["loaded_weights"]["match"])
+        once = model_mod.local_residual
+        with mock.patch.object(model_mod, "local_residual", lambda x: once(once(x))):  # residual applied twice
+            self.assertFalse(check.transfer_check(state, config["model"], self.store, validation, reference, "cpu",
+                                                  **common)["match"])
+
+    def test_swap_test_changes_only_the_slot_and_the_frozen_crops_stay_put(self):
+        from rsvt.experiments import m3d_pretrain_check as check
+        config = small_config()
+        validation = self.pairs()
+        torch.manual_seed(3)
+        model = CoarseToFineRSVT(**config["model"])
+        rows = check.swap_test(model, self.store, validation["volumes"], "cpu", grid=12, crop_mm=16.)
+        self.assertEqual(len(rows), 4)
+        self.assertTrue(all(r["other_crops"] == config["model"]["crops_at_inference"] - 1 for r in rows))
+        self.assertTrue(any(r["edited"]["slot_crop_logit"] != r["unedited"]["slot_crop_logit"] for r in rows))
+        original = VolumeCase.crops
+
+        def same(case, centers, source=None):  # the "unedited" slot gets the edited crop: nothing may change
+            return original(case, centers)
+        with mock.patch.object(VolumeCase, "crops", same):
+            for row in check.swap_test(model, self.store, validation["volumes"], "cpu", grid=12, crop_mm=16.):
+                self.assertEqual(row["edited"], row["unedited"])
+        frozen = {k: v.clone() for k, v in model.fine.state_dict().items()}
+        for parameter in model.fine.parameters():
+            parameter.requires_grad_(False)
+        curve = check.train_fusion(model, self.store, config, steps=2, device="cpu")
+        self.assertEqual([c["step"] for c in curve], [1, 2])
+        for key, value in model.fine.state_dict().items():
+            torch.testing.assert_close(value, frozen[key], rtol=0, atol=0, msg=key)
+
+    def test_patient_intervals_metrics_and_conclusions(self):
+        from rsvt.experiments.m3d_pretrain_check import cluster_interval, interpret, swap_metrics
+        self.assertEqual(cluster_interval([1., 0., 1.], ["a", "a", "a"], 20), [2 / 3, 2 / 3])  # one patient: no spread
+        low, high = cluster_interval([1., 1., 0., 0.], ["a", "a", "b", "b"], 400)
+        self.assertTrue(0. <= low < .5 < high <= 1.)
+
+        def row(op, patient, scan, crop):
+            return {"operation": op, "patient_id": patient, "other_crops_holding_edit": 0,
+                    "edited": {"scan_logit": scan, "max_crop_logit": crop, "slot_crop_logit": crop},
+                    "unedited": {"scan_logit": 0., "max_crop_logit": 0., "slot_crop_logit": 0.}}
+        rows = ([row("removal", f"p{i}", 1., 2.) for i in range(6)]
+                + [row("insertion", f"p{i}", -1. if i % 2 else 0., 2.) for i in range(6)])
+        metrics = swap_metrics(rows, resamples=200)
+        self.assertEqual(metrics["removal"]["scan_logit"]["paired_accuracy"], 1.)
+        self.assertEqual(metrics["insertion"]["scan_logit"]["paired_accuracy"], .25)  # three ties, three drops
+        self.assertEqual((metrics["all"]["scans"], metrics["all"]["patients"]), (12, 6))
+        ok = {"match": True}
+        self.assertIn("implementation error", interpret({"match": False}, "learned", None))
+        self.assertIn("did not reproduce", interpret(ok, "not_learned", None))
+        text = interpret(ok, "learned", {"after_training": metrics})
+        self.assertIn("for insertion", text)
+        self.assertIn("not using evidence the crops carry", text)  # the largest crop score did respond
+        everything = swap_metrics([row("removal", f"p{i}", 1., 2.) for i in range(6)]
+                                  + [row("insertion", f"p{i}", 1., 2.) for i in range(6)], resamples=200)
+        self.assertIn("Proceed with run 3", interpret(ok, "learned", {"after_training": everything}))
+
+    def test_pretrain_check_saves_weights_and_uses_train_and_validation_only(self):
+        from rsvt.experiments import m3d_pretrain_check as check
+        out = Path(self.tmp.name) / "pretrain_check"
+        events = []
+        with mock.patch.object(check, "verdict", return_value="learned"):  # two steps learn nothing; run check 2 anyway
+            result = check.pretrain_check(self.store, small_config(), out, progress=events.append, **self.tiny())
+        saved = json.loads((out / "pretrain_check.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved["interpretation"], result["interpretation"])
+        self.assertTrue(result["transfer"]["match"])
+        self.assertEqual((sum(result["pairs"]["train"].values()), sum(result["pairs"]["validation"].values())), (8, 4))
+        validation_ids = {v["volume_id"] for v in self.store.manifest["volumes"] if v["split"] == "validation"}
+        self.assertTrue({r["volume_id"] for r in result["validation_pairs"]} <= validation_ids)
+        swap = result["swap_test"]
+        self.assertTrue(swap["crop_network_unchanged"])
+        self.assertEqual(swap["after_training"]["all"]["scans"], 4)
+        self.assertEqual(len(swap["fusion_curve"]), 2)
+        receipt = json.loads((out / "fine_branch.pt.json").read_text(encoding="utf-8"))
+        self.assertEqual(receipt["sha256"], hashlib.sha256((out / "fine_branch.pt").read_bytes()).hexdigest())
+        weights = torch.load(out / "fine_branch.pt", weights_only=True)
+        model = CoarseToFineRSVT(**small_config()["model"])
+        model.fine.load_state_dict(weights["fine"])  # loads into the full model's crop network as saved
+        self.assertEqual(weights["format_version"], check.WEIGHTS_FORMAT)
+        self.assertEqual(result["test_volumes_opened"], 0)
+        stages = {e["stage"] for e in events}
+        self.assertTrue({"pretrain", "transfer", "fusion", "swap_test"} <= stages)
+        skipped = check.pretrain_check(self.store, small_config(), Path(self.tmp.name) / "skipped", **self.tiny())
+        if skipped["pretraining"]["verdict"] not in ("learned", "partly"):
+            self.assertIn("did not learn", skipped["swap_test"]["skipped"])
+
+    def test_notebook_runs_the_pretrain_check_instead_of_training(self):
+        from rsvt.training.m3d_notebook import M3DNotebookSession
+        root = Path(self.tmp.name)
+        (root / "pre_project/outputs/rsvt_training").mkdir(parents=True)
+        common = dict(configuration=small_config(), epochs=2, learning_rate=1e-3, patience=0, seed=13,
+                      patients_train=2, patients_validation=1, generators=GENS, metadata_dir=self.fx.meta_dir,
+                      lidc_root=self.fx.lidc, enforce_drive=False, display_enabled=False,
+                      store_root=self.fx.store, cache_root=root / "pre_cache")
+        training = M3DNotebookSession(root / "pre_project", REPO, **common)
+        self.assertIsNone(training.run_check())  # RUN = "train": no check
+        self.assertIsNone(training.run_pretrain_check())
+        session = M3DNotebookSession(root / "pre_project", REPO, run="pretrain_check", **common)
+        with mock.patch.object(trainer, "run_training", side_effect=AssertionError("trained")):
+            self.assertIsNone(session.train_when_ready())
+        with mock.patch.object(torch.cuda, "is_available", return_value=False):
+            self.assertIsNone(session.run_check())  # waits for a GPU
+        from rsvt.experiments import m3d_pretrain_check as check
+        with mock.patch.object(check, "verdict", return_value="learned"):
+            result = session.run_check(**self.tiny())
+        records = session.verify_saved()
+        for name in ("pretrain_check/pretrain_check.json", "pretrain_check/fine_branch.pt", "figures/pretrain_check.png"):
+            self.assertIn(name, records)
+        self.assertIn("Crop pretraining check: " + result["interpretation"],
+                      (session.root / "run_overview.md").read_text(encoding="utf-8"))
+
+
 class BoxRuleAndLabelTail(unittest.TestCase):
     """Deeper boxes, inspected label tails and re-streaming under a new rule (25 Nov 2026)."""
 

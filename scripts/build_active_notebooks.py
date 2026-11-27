@@ -14,6 +14,10 @@ after the first training run stayed at chance.
 26 Nov 2026 (later): the check passed on residual crops, so `RUN` defaults to training
 again, now with a residual crop input, AUROC-based checkpoint selection and a
 validation score with the edit's crop added.
+
+27 Nov 2026: the second training run learned nothing, so `RUN` defaults to the crop
+pretraining check (section 12): pretrain the crop network, verify the transfer into the
+full model, and swap-test the scan classifier before a third run.
 """
 
 from copy import deepcopy
@@ -109,8 +113,9 @@ def training_notebook():
         '1. **First, on a CPU runtime** (cheapest): it downloads and verifies the dataset, runs the data checks and stops '
         'before training. This takes hours; keep the tab open.\n'
         '2. **Then on a GPU runtime** (Runtime → Change runtime type → L4): it reads the saved dataset back, reuses the '
-        'checks and then does what `RUN` says. The default, `RUN = "train"`, trains the model; `RUN = "crop_check"` only '
-        'checks that the crop network can learn the edit (about 30 minutes) and does not train.\n'
+        'checks and then does what `RUN` says. The default, `RUN = "pretrain_check"`, runs two short checks before the '
+        'next training run (roughly 1–1½ hours, no training); `RUN = "train"` trains the model; `RUN = "crop_check"` '
+        'repeats the crop learning check of 26 November.\n'
         '3. **After a disconnect**, Run all again: it continues the unfinished training run with the code it started with.\n\n'
         'When a run finishes and every saved file has been read back from Drive, the last cell releases the runtime so it '
         'stops using compute units; the outputs stay visible.\n\n'
@@ -126,14 +131,14 @@ def training_notebook():
     sections=[
         ('settings','1. Choose the run settings',
          'Why: everything you might change is here, and the defaults are ready to run. The notebook prepares data and '
-         'checks it according to what is saved and whether a GPU is present; on a GPU, `RUN` chooses between the crop '
-         'learning check (section 12, no training) and training (section 13). With `RUN = "train"`, '
+         'checks it according to what is saved and whether a GPU is present; on a GPU, `RUN` chooses between a check '
+         'before training (section 12, no training) and training (section 13). With `RUN = "train"`, '
          '`RESUME_SESSION = "auto"` continues the latest unfinished training run; changing any setting below needs a new '
          'run, so then set `RESUME_SESSION = ""`. `CODE_REF` chooses the code for a new run (a branch, tag or commit). '
          '`LIDC_ROOT` may point to an existing LIDC-IDRI download in Drive (NBIA folder layout).',
          'PROJECT = "/content/drive/MyDrive/Research/LUNG-CT-SCAN"\n'
          f'REPOSITORY = "{REPOSITORY}"\n'
-         'RUN = "train"              # "train" = train; "crop_check" = can the crop network learn the edit? (no training)\n'
+         'RUN = "pretrain_check"     # a check, no training: "pretrain_check" or "crop_check"; "train" = train\n'
          'CODE_REF = "main"          # code for a new run; a resumed run keeps the commit it started with\n'
          'RESUME_SESSION = "auto"    # "auto" = continue the latest unfinished run; "" = new run; or a run folder\n'
          'GENERATORS = ["cycle", "pix2pix", "diffusion"]  # remove one to hold it out\n'
@@ -195,17 +200,18 @@ def training_notebook():
          'Why: see parameters and compute. The 96³ view gives anatomy context and a router chooses K native-resolution crops; '
          'evidence is read only there. The table compares this with running the same encoder over the whole native volume.',
          'if session.has_store():\n    parameter_count = session.show_model()\n'),
-        ('crop_check','12. Check that the crop network can learn the edit',
-         'Why: the first full training run (26 Nov 2026) left every tamper loss at chance, even on training volumes. '
-         'This trains the model\'s crop network alone, with fresh weights, on crops that always contain the edit: each pair '
-         'is a manipulated crop and the same crop of its real scan, so they differ only in the changed voxels. Removals '
-         'and insertions are balanced, so "is there a nodule here" cannot separate them. It fits 32 training pairs, then '
-         'learns from up to 384 pairs and is tested on up to 192 pairs from unseen validation patients, once on the windowed '
-         'image and once on its residual (image minus local mean). On 26 Nov it learned the edit from the residual (removal '
-         'crop AUROC 0.94, insertion 0.75 on unseen patients) but not from the image (0.69), so the model now reads residual '
-         'crops. Runs only with `RUN = "crop_check"` on a GPU, in about 30 minutes. Expected output: a table, curves and a '
-         'one-line conclusion. No test data is opened.',
-         'crop_check = session.run_crop_check() if session.has_store() else None\n'),
+        ('crop_check','12. Check the crop network before training',
+         'Why: the second training run (26 Nov 2026) learned nothing. Its crop network never beat a constant guess, and '
+         'adding the edit\'s crop to a scan changed its score by at most 0.0007. With `RUN = "pretrain_check"` (the '
+         'default) this runs two short checks before a third run. (1) It trains the model\'s crop network alone on up to '
+         '384 training pairs, each an edited crop and the same crop of its unedited scan, cut exactly as the model cuts its '
+         'crops. It then loads the weights into a fresh model and checks that the same validation crops (up to 192, unseen '
+         'patients) get the same scores. (2) It freezes the crop network, trains the rest of the model briefly, and scores '
+         'each unseen edited scan twice, with one crop swapped between edited and unedited: does the scan score rise with '
+         'the edited crop? Roughly 1–1½ hours on an L4. `RUN = "crop_check"` repeats the crop learning check of 26 Nov '
+         '(residual crops: AUROC 0.94 for removal, 0.75 for insertion on unseen patients). Expected output: a table, curves '
+         'and a one-line conclusion. No test data is opened.',
+         'check = session.run_check() if session.has_store() else None\n'),
         ('training','13. Train and watch the epoch results',
          'Why: learn from training volumes and monitor validation volumes. On a GPU runtime with `RUN = "train"` this '
          'trains, or continues the unfinished run; otherwise it stops here with a message. Expected output: batch progress, an updating epoch '
