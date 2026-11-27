@@ -42,7 +42,7 @@ class M3DNotebookSession:
                  patients_train=200, patients_validation=100, generators=("cycle", "pix2pix", "diffusion"),
                  resume_session="", configuration=None, store_root=None, cache_root=None, work_root=None,
                  lidc_root=None, metadata_dir=None, enforce_drive=True, display_enabled=True, code_commit=None, run="train",
-                 recheck_dataset=True):
+                 recheck_dataset=True, fine_init=""):
         if run not in RUNS:
             raise ValueError("RUN must be one of: " + ", ".join(f'"{r}"' for r in RUNS))
         self.run = run
@@ -72,6 +72,12 @@ class M3DNotebookSession:
                      parent / ("c2f_" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")))
         if not self.root.is_relative_to(parent) or self.root == parent:
             raise ValueError("Keep sessions inside project Drive outputs/rsvt_training")
+        # Training only: which pretraining check's crop weights the run starts from (None = random weights).
+        self.fine_init_note = ""
+        self.fine_init = self._find_fine_init(fine_init, parent, resume_session) if run == "train" else None
+        if self.fine_init:
+            self.config["training"]["fine_init_sha256"] = self.fine_init["sha256"]
+            self.config = trainer.validate_config(self.config)
         binding = {"config_sha256": store_mod.digest_json(self.config),
                    "implementation_sha256": trainer.implementation_fingerprint()}
         if resume_session:
@@ -86,7 +92,7 @@ class M3DNotebookSession:
         write_profile(self.root / "training_config.toml", self.config)
         self.artifacts, self._handles, self._history = {}, {}, []
         self._save_json("notebook_session.json", {"binding": binding, "store": str(self.store_root),
-                                                  "code_commit": code_commit, "run": run,
+                                                  "code_commit": code_commit, "run": run, "fine_init": self.fine_init,
                                                   "created_utc": datetime.now(timezone.utc).isoformat(),
                                                   "test_status": "not_acquired_reserved_for_final_evaluation"})
         if metadata_dir is None:
@@ -104,6 +110,43 @@ class M3DNotebookSession:
             generators=self.config["data"]["generators"], seed=acquisition["seed"])
 
     # ------------------------------------------------------------------ helpers
+    def _find_fine_init(self, setting, parent, resume_session):
+        """The crop pretraining check a training run starts its crop network from, or None for random weights.
+
+        A resumed run keeps what it started with. "auto" takes the newest check that passed
+        (the transfer matched and the scan score responded for both operations); a named run
+        folder must hold a passed check. The weights must match their own receipt.
+        """
+        from rsvt.experiments import m3d_pretrain_check as pretrain
+        if resume_session:
+            stored = json.loads((self.root / "notebook_session.json").read_text(encoding="utf-8"))
+            return stored.get("fine_init")
+        if not setting:
+            return None
+        if setting == "auto":
+            candidates = sorted(parent.glob("c2f_*/pretrain_check/pretrain_check.json"), reverse=True)
+        else:
+            folder = Path(setting)
+            candidates = [(folder / "pretrain_check" if (folder / "pretrain_check").is_dir() else folder) / "pretrain_check.json"]
+        for path in candidates:
+            try:
+                result = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                result = {}
+            if not pretrain.passed(result):
+                if setting != "auto":
+                    raise ValueError(f"FINE_INIT names {path.parent}, which holds no passed crop pretraining check. "
+                                     'Set FINE_INIT = "auto" or "" (random start).')
+                continue
+            weights = path.parent / pretrain.WEIGHTS
+            receipt = json.loads(weights.with_name(weights.name + ".json").read_text(encoding="utf-8"))
+            digest = sha256_path(weights)
+            if digest != receipt["sha256"]:
+                raise OSError("Pretrained crop weights differ from their receipt: " + str(weights))
+            return {"folder": str(path.parent), "run": path.parent.parent.name, "sha256": digest}
+        self.fine_init_note = "no passed crop pretraining check was found in Drive"
+        return None
+
     def _html(self, text):
         if self.display_enabled:
             from IPython.display import HTML, display
@@ -481,6 +524,10 @@ class M3DNotebookSession:
                 ("Crops at inference (compute budget)", m["crops_at_inference"]),
                 ("Crop network input", "residual: image minus its 3×3×3 local mean" if m.get("fine_input", "residual") == "residual"
                  else "windowed image"),
+                ("Crop network start", f"weights pretrained by the crop pretraining check of run {self.fine_init['run']} "
+                                       f"(SHA-256 {self.fine_init['sha256'][:12]}…); that check's validation pairs are "
+                                       "scored every epoch" if self.fine_init else
+                 "random weights" + (f" ({self.fine_init_note})" if self.fine_init_note else "")),
                 ("Crop extent", f"{d['crop_mm']} mm on the native voxel grid"),
                 ("Augmentation", f"left-right flip p={d['flip_probability']}, crop jitter ±{d['jitter_fraction']} of crop size"),
                 ("Risk stage starts", f"epoch {t['risk_start_epoch'] + 1}"),
@@ -518,12 +565,13 @@ class M3DNotebookSession:
         number = lambda v, p=False: "—" if v is None else (f"{100 * v:.1f}%" if p else f"{v:.3f}")
         return table_html(["Epoch", "Stage", "LR", "Train objective", "Train crop loss", "Selection AUROC",
                            "Removal AUROC", "Insertion AUROC", "Worst-generator AUROC", "AUROC with edit crop",
-                           "Router recall@K", "Removal recall @10% FPR"],
+                           "Router recall@K", "Removal recall @10% FPR", "Fixed pairs right (removal / insertion)"],
                           [[r["epoch"], r["stage"], f"{r['learning_rate']:.2g}", number(r["training_objective"]),
                             number(r.get("train_crop_tamper")), number(r.get("validation_selection_auroc")),
                             number(r["validation_removal_auroc"]), number(r.get("validation_insertion_auroc")),
                             number(r["validation_worst_generator_auroc"]), number(r.get("validation_tamper_auroc_with_site")),
-                            number(r["validation_router_recall"], True), number(r["validation_removal_recall_fpr10"], True)]
+                            number(r["validation_router_recall"], True), number(r["validation_removal_recall_fpr10"], True),
+                            f"{number(r.get('validation_pairs_removal'), True)} / {number(r.get('validation_pairs_insertion'), True)}"]
                            for r in rows])
 
     def _curves(self, rows):
@@ -538,6 +586,10 @@ class M3DNotebookSession:
                            ("validation_removal_auroc", "Removal AUROC"), ("validation_insertion_auroc", "Insertion AUROC"),
                            ("validation_tamper_auroc_with_site", "Tamper AUROC with the edit crop (diagnostic)")):
             axes[1].plot(epochs, [value(r, key) for r in rows], marker="o", label=label)
+        if any(r.get("validation_pairs_removal") is not None for r in rows):
+            for key, label in (("validation_pairs_removal", "Fixed pairs right, removal"),
+                               ("validation_pairs_insertion", "Fixed pairs right, insertion")):
+                axes[1].plot(epochs, [value(r, key) for r in rows], marker=".", linestyle="--", label=label)
         axes[1].axhline(.5, color="grey", linestyle=":")
         axes[0].set(title="Training loss", xlabel="Epoch")
         axes[1].set(title="Validation discrimination", xlabel="Epoch", ylim=(0, 1))
@@ -784,7 +836,8 @@ class M3DNotebookSession:
                 return summary
         summary = trainer.run_training(self.store_root, self.cache_root, self.config, self.training_dir,
                                        resume=(self.training_dir / "run_contract.json").exists(),
-                                       progress=self._train_progress)
+                                       progress=self._train_progress,
+                                       pretrained=Path(self.fine_init["folder"]) if self.fine_init else None)
         return summary
 
     def show_history(self):
@@ -828,6 +881,14 @@ class M3DNotebookSession:
                 ("Diagnostic: the edit's crop alone, crop-network AUROC (removal / insertion)",
                  f"{number(site.get('crop_tamper_auroc'))} ({number(site.get('crop_removal_auroc'))} / "
                  f"{number(site.get('crop_insertion_auroc'))})")]
+        pairs = summary.get("fixed_pairs")
+        if pairs:
+            start = json.loads((self.training_dir / "fine_init.json").read_text(encoding="utf-8"))["at_start"]
+            share = lambda scores, op: number((scores.get(op) or {}).get("paired_accuracy"), True)
+            rows.append(("Diagnostic: fixed validation pairs, edited crop above its unedited twin (removal / insertion), "
+                         "selected epoch vs pretrained start",
+                         f"{share(pairs, 'removal')} / {share(pairs, 'insertion')} vs "
+                         f"{share(start, 'removal')} / {share(start, 'insertion')}"))
         for name, point in m["operating_points"].items():
             rows.append((f"Removal / insertion recall at {name.replace('fpr_', '')} FPR (threshold from these authentic cases)",
                          f"{number(point['removal_recall'], True)} / {number(point['insertion_recall'], True)}"))
@@ -865,6 +926,9 @@ class M3DNotebookSession:
                      if record.get("full_readback", True) else
                      f"Dataset: full read-back skipped (RECHECK_DATASET = False); run {record['reused_full_readback']['run']} "
                      "read the same manifest back in full, and each file opened here was checked when loaded.\n\n")
+        if self.fine_init:
+            text += (f"Crop network started from the weights pretrained in run {self.fine_init['run']} "
+                     f"(SHA-256 {self.fine_init['sha256']}).\n\n")
         if summary.exists():
             m = json.loads(summary.read_text(encoding="utf-8"))["validation_metrics"]
             text += (f"Validation tamper AUROC {m['tamper_auroc']}; removal AUROC {m['removal_auroc']}; "

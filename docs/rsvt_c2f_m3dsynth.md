@@ -291,9 +291,8 @@ was opened. Intervals resample whole patients (100 validation patients).
 
 ## Crop pretraining check
 
-`src/rsvt/experiments/m3d_pretrain_check.py` (`RUN = "pretrain_check"`, the notebook
-default since 27 Nov) runs two short checks before a third training run, agreed
-after review of the second run:
+`src/rsvt/experiments/m3d_pretrain_check.py` (`RUN = "pretrain_check"`) runs two
+short checks before a third training run, agreed after review of the second run:
 
 1. **Pretrain and verify the transfer.** The model's crop network is trained alone
    with the crop check's recipe (2,000 steps, 8 pairs per step, peak learning rate
@@ -328,12 +327,67 @@ the same validation pairs every epoch. If the crops carry the edit but the scan
 score does not respond, how the model combines crop evidence comes before another
 full run.
 
+### Result (27 November 2026)
+
+Run `c2f_20261127T100922_820082Z` (commit `8d1fca3`, L4, 1 h 33 min) passed both
+checks. Validation figures come from 192 pairs (32 per generator and operation) of 64
+patients the crop network never saw; intervals resample whole patients.
+
+| | Removal | Insertion |
+|---|---|---|
+| Pretraining: edited crop scored above its unedited twin | 96.9% (93–100%) | 92.7% (88–98%) |
+| Pretraining: crop AUROC | 0.96 | 0.88 |
+| Swap test before brief training: scan score higher with the edited crop | 5% (mean logit change −0.005) | 17% (−0.003) |
+| **Swap test after 300 steps, crop network frozen** | **86% (75–95%)**, mean +1.80 | **83% (72–92%)**, mean +1.68 |
+| Yardstick after training: largest crop logit higher | 89% | 82% |
+
+- The crop network learned as in the crop learning check: flat for about 200 steps,
+  then rising. By generator, diffusion was easiest (crop AUROC 0.996 removal, 0.969
+  insertion) and pix2pix hardest (0.94, 0.79).
+- The transfer was exact: identical scores after loading into a fresh full model,
+  and identical crops through the model's data path.
+- Before the brief training the scan score ignored the crop, as in run 2. After it,
+  the scan classifier used the crop about as well as the largest crop score does,
+  and the scan-level training loss fell from 0.70 to 0.52 within 300 steps (run 2:
+  0.69–0.70 for all 1,250 steps). By generator the scan score rose for 97% of
+  diffusion edits (both operations), 84% / 81% of cycle removals / insertions and
+  78% / 72% of pix2pix.
+- Both checks give the model the edit's location, so they say nothing about routing.
+  In run 2 the router's crops held the edit in 31% of validation scans (53% of
+  removals, 25% of insertions).
+
+## Third training run
+
+Run 3 (`RUN = "train"`, the notebook default again from the evening of 27 Nov)
+changes only the crop network's starting weights; the router, objective, schedule,
+learning rate and checkpoint rule are those of run 2.
+
+- `FINE_INIT = "auto"` takes the newest crop pretraining check in project Drive that
+  passed (transfer matched and the scan score responded for both operations). The
+  weights must match their receipt and the checksum the run's configuration records
+  (`training.fine_init_sha256`), and must have been built with the model's crop
+  network settings. They are loaded before the first step. Before training starts,
+  the loaded network must reproduce the check's own validation scores on its 192
+  pairs (within 0.01); otherwise the run stops. A resumed run keeps the weights it
+  saved and the check it started from.
+- Every epoch also scores those 192 fixed validation pairs (the edited crop against
+  the same crop of its unedited scan, cut as the model cuts its site crop). The
+  epoch table shows the share ordered correctly per operation. If it falls, joint
+  training is eroding what the crop network learned; the deferred paired crop loss
+  is the response to that. The pairs are diagnostic only and never choose the
+  checkpoint.
+- What to read: removal and insertion AUROC against authentic scans; the AUROC with
+  the edit's crop added; and router recall. With a working crop network, the gap
+  between the score with the edit's crop added and the router-only score is what
+  routing loses. If that gap is large, the router is the next thing to fix.
+
 ## Running it
 
 Open `notebooks/01_RSVT_TRAINING.ipynb` in Colab from GitHub and use Run all. On a
-GPU, `RUN` chooses what the run does: `"pretrain_check"` (the default since 27 Nov)
-and `"crop_check"` run a check in section 12 and do not train; `"train"` trains in
-section 13.
+GPU, `RUN` chooses what the run does: `"train"` (the default) trains in section 13,
+its crop network starting from the latest passed pretraining check
+(`FINE_INIT = "auto"`; `""` starts from random weights); `"pretrain_check"` and
+`"crop_check"` run a check in section 12 and do not train.
 With `RUN = "train"`, section 3 continues the latest unfinished training
 run when there is one (`RESUME_SESSION = "auto"`), checking out the commit that
 run started with; otherwise it clones the public repository at `CODE_REF`. Section

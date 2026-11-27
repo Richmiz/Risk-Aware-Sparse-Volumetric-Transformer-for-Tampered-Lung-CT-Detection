@@ -22,6 +22,11 @@ full model, and swap-test the scan classifier before a third run.
 27 Nov 2026 (later): `RECHECK_DATASET = False` (user request) skips section 7's
 hour-long full read-back of the saved dataset when an earlier run already read the
 same store back in full; every file a run opens is still checked when loaded.
+
+27 Nov 2026 (evening): the pretraining check passed (scan score rose with the edited crop
+for 86% of removals and 83% of insertions on unseen patients), so `RUN` defaults to
+training again: run 3, whose crop network starts from the check's weights
+(`FINE_INIT = "auto"`) and whose epochs also score the check's 192 fixed validation pairs.
 """
 
 from copy import deepcopy
@@ -117,9 +122,10 @@ def training_notebook():
         '1. **First, on a CPU runtime** (cheapest): it downloads and verifies the dataset, runs the data checks and stops '
         'before training. This takes hours; keep the tab open.\n'
         '2. **Then on a GPU runtime** (Runtime → Change runtime type → L4): it opens the saved dataset (read back in full '
-        'once; later runs skip that unless `RECHECK_DATASET = True`), reuses the checks and then does what `RUN` says. The default, `RUN = "pretrain_check"`, runs two short checks before the '
-        'next training run (roughly 1–1½ hours, no training); `RUN = "train"` trains the model; `RUN = "crop_check"` '
-        'repeats the crop learning check of 26 November.\n'
+        'once; later runs skip that unless `RECHECK_DATASET = True`), reuses the checks and then does what `RUN` says. '
+        'The default, `RUN = "train"`, trains the model, its crop network starting from the weights of the latest passed '
+        'crop pretraining check (`FINE_INIT = "auto"`); `RUN = "pretrain_check"` repeats that check (roughly 1½ hours, '
+        'no training) and `RUN = "crop_check"` the crop learning check of 26 November.\n'
         '3. **After a disconnect**, Run all again: it continues the unfinished training run with the code it started with.\n\n'
         'When a run finishes and every saved file has been read back from Drive, the last cell releases the runtime so it '
         'stops using compute units; the outputs stay visible.\n\n'
@@ -141,10 +147,13 @@ def training_notebook():
          'run, so then set `RESUME_SESSION = ""`. `CODE_REF` chooses the code for a new run (a branch, tag or commit). '
          '`LIDC_ROOT` may point to an existing LIDC-IDRI download in Drive (NBIA folder layout). '
          '`RECHECK_DATASET = False` skips re-reading the whole saved dataset (about an hour) when an earlier run already '
-         'read it back in full; set it to `True` to read it all again.',
+         'read it back in full; set it to `True` to read it all again. With `RUN = "train"`, `FINE_INIT = "auto"` starts the '
+         'crop network from the weights of the newest crop pretraining check that passed (section 12); `""` starts it from '
+         'random weights, and a run folder names one check.',
          'PROJECT = "/content/drive/MyDrive/Research/LUNG-CT-SCAN"\n'
          f'REPOSITORY = "{REPOSITORY}"\n'
-         'RUN = "pretrain_check"     # a check, no training: "pretrain_check" or "crop_check"; "train" = train\n'
+         'RUN = "train"              # "train" = train; a check, no training: "pretrain_check" or "crop_check"\n'
+         'FINE_INIT = "auto"         # crop network start: "auto" = latest passed pretraining check; "" = random\n'
          'CODE_REF = "main"          # code for a new run; a resumed run keeps the commit it started with\n'
          'RESUME_SESSION = "auto"    # "auto" = continue the latest unfinished run; "" = new run; or a run folder\n'
          'GENERATORS = ["cycle", "pix2pix", "diffusion"]  # remove one to hold it out\n'
@@ -171,7 +180,7 @@ def training_notebook():
          '    patience=EARLY_STOPPING_PATIENCE, seed=SEED, patients_train=PATIENTS_TRAIN,\n'
          '    patients_validation=PATIENTS_VALIDATION, generators=tuple(GENERATORS),\n'
          '    lidc_root=LIDC_ROOT or None, resume_session=RESUME_FOLDER, code_commit=RSVT_COMMIT, run=RUN,\n'
-         '    recheck_dataset=RECHECK_DATASET)\n'
+         '    recheck_dataset=RECHECK_DATASET, fine_init=FINE_INIT)\n'
          'print("Run folder in Drive:", session.root)\n'),
         ('hardware','5. Check the actual runtime and GPU',
          'Why: a server label is not proof of a GPU. This checks what PyTorch sees. Data preparation and the data checks '
@@ -212,20 +221,24 @@ def training_notebook():
          'if session.has_store():\n    parameter_count = session.show_model()\n'),
         ('crop_check','12. Check the crop network before training',
          'Why: the second training run (26 Nov 2026) learned nothing. Its crop network never beat a constant guess, and '
-         'adding the edit\'s crop to a scan changed its score by at most 0.0007. With `RUN = "pretrain_check"` (the '
-         'default) this runs two short checks before a third run. (1) It trains the model\'s crop network alone on up to '
+         'adding the edit\'s crop to a scan changed its score by at most 0.0007. With `RUN = "pretrain_check"` this runs '
+         'two short checks before another training run; with `RUN = "train"` nothing runs here. (1) It trains the model\'s crop network alone on up to '
          '384 training pairs, each an edited crop and the same crop of its unedited scan, cut exactly as the model cuts its '
          'crops. It then loads the weights into a fresh model and checks that the same validation crops (up to 192, unseen '
          'patients) get the same scores. (2) It freezes the crop network, trains the rest of the model briefly, and scores '
          'each unseen edited scan twice, with one crop swapped between edited and unedited: does the scan score rise with '
-         'the edited crop? Roughly 1–1½ hours on an L4. `RUN = "crop_check"` repeats the crop learning check of 26 Nov '
+         'the edited crop? On 27 Nov both passed (86% of removals, 83% of insertions), so run 3 starts its crop network '
+         'from those weights. Roughly 1½ hours on an L4. `RUN = "crop_check"` repeats the crop learning check of 26 Nov '
          '(residual crops: AUROC 0.94 for removal, 0.75 for insertion on unseen patients). Expected output: a table, curves '
          'and a one-line conclusion. No test data is opened.',
          'check = session.run_check() if session.has_store() else None\n'),
         ('training','13. Train and watch the epoch results',
          'Why: learn from training volumes and monitor validation volumes. On a GPU runtime with `RUN = "train"` this '
          'trains, or continues the unfinished run; otherwise it stops here with a message. Expected output: batch progress, an updating epoch '
-         'table and learning curves. The crop network reads each crop minus its local mean (the residual), as in section 12. '
+         'table and learning curves. The crop network reads each crop minus its local mean (the residual), as in section 12, '
+         'and starts from the weights of the latest passed pretraining check (`FINE_INIT`); every epoch also scores that '
+         'check\'s 192 fixed validation pairs (edited crop vs the same crop of the unedited scan), so a falling share shows '
+         'joint training eroding what the crop network learned. '
          'The first epochs train without tail risk; the checkpoint is chosen among risk-stage epochs by the mean of removal '
          'and insertion AUROC against authentic validation scans, and only if it beats chance (0.5), so a model that gives '
          'every scan the same score is never chosen. Each validation scan is also scored with the edit\'s crop added; that '

@@ -1288,6 +1288,159 @@ class PretrainCheck(unittest.TestCase):
                       (session.root / "run_overview.md").read_text(encoding="utf-8"))
 
 
+class PretrainedStart(unittest.TestCase):
+    """Run 3: the crop network starts from a passed pretraining check and its fixed pairs are scored every epoch."""
+
+    @classmethod
+    def setUpClass(cls):
+        from rsvt.experiments import m3d_pretrain_check as check
+        cls.tmp = TemporaryDirectory(ignore_cleanup_errors=True)
+        cls.fx = Fixture(cls.tmp.name)
+        cls.fx.acquire()
+        cls.store = M3DStore(cls.fx.store, Path(cls.tmp.name) / "cache")
+        cls.check = Path(cls.tmp.name) / "pretrain_check"
+        settings = dict(device="cpu", per_operation_train=0, per_operation_validation=0, steps=2, batch_pairs=2,
+                        eval_every=1, fusion_steps=1, resamples=20)
+        with mock.patch.object(check, "verdict", return_value="learned"):
+            check.pretrain_check(cls.store, small_config(), cls.check, **settings)
+        cls.sha = hashlib.sha256((cls.check / check.WEIGHTS).read_bytes()).hexdigest()
+
+    @classmethod
+    def tearDownClass(cls):
+        import gc
+        gc.collect()
+        cls.tmp.cleanup()
+
+    def copy_check(self, name, change=None):
+        import shutil
+        folder = Path(self.tmp.name) / name
+        shutil.copytree(self.check, folder)
+        if change:
+            result = json.loads((folder / "pretrain_check.json").read_text(encoding="utf-8"))
+            change(result)
+            store_mod.write_json(folder / "pretrain_check.json", result)
+        return folder
+
+    def train(self, name, config, pretrained, **settings):
+        return trainer.run_training(self.fx.store, Path(self.tmp.name) / ("cache_" + name), config,
+                                    Path(self.tmp.name) / name, pretrained=pretrained, **settings)
+
+    def test_training_starts_from_the_verified_weights_and_scores_the_fixed_pairs(self):
+        from rsvt.experiments import m3d_pretrain_check as check
+        config = small_config(fine_init_sha256=self.sha)
+        with self.assertRaisesRegex(ValueError, "exactly when"):
+            self.train("no_folder", config, None)
+        with self.assertRaisesRegex(ValueError, "exactly when"):
+            self.train("no_checksum", small_config(), self.check)
+        with self.assertRaisesRegex(ValueError, "checksum the configuration names"):
+            self.train("wrong_checksum", small_config(fine_init_sha256="0" * 64), self.check)
+        with self.assertRaisesRegex(ValueError, "fine_init_sha256"):
+            trainer.validate_config(small_config(fine_init_sha256="not a checksum"))
+        saved = torch.load(self.check / check.WEIGHTS, weights_only=True)["fine"]
+        started, events, original = [], [], trainer.score_fixed_pairs
+
+        def spy(model, pairs, device):
+            if not started:
+                started.append({k: v.detach().clone() for k, v in model.fine.state_dict().items()})
+            return original(model, pairs, device)
+        with mock.patch.object(trainer, "score_fixed_pairs", spy):
+            self.train("run3", config, self.check, stop_after_epoch=1, progress=events.append)
+        for key, value in saved.items():  # the first epoch begins from the pretrained crop network
+            torch.testing.assert_close(started[0][key], value, rtol=0, atol=0, msg=key)
+        out = Path(self.tmp.name) / "run3"
+        start = json.loads((out / "fine_init.json").read_text(encoding="utf-8"))
+        final = json.loads((self.check / "pretrain_check.json").read_text(encoding="utf-8"))["pretraining"]["final"]
+        self.assertTrue(start["reproduces_pretraining"])
+        for key in ("paired_accuracy", "crop_auroc"):  # the same crops and weights give the same scores
+            self.assertAlmostEqual(start["at_start"]["all"][key], final["all"][key], places=9)
+        self.assertEqual(start["weights_sha256"], self.sha)
+        self.assertIn("pretrain_check_sha256", json.loads((out / "run_contract.json").read_text(encoding="utf-8")))
+        self.assertIn("fine_init", {e.get("event") for e in events})
+        summary = self.train("run3", config, self.check, resume=True, progress=events.append)
+        self.assertEqual([e.get("event") for e in events].count("fine_init"), 1)  # a resumed run keeps its own weights
+        self.assertEqual(json.loads((out / "fine_init.json").read_text(encoding="utf-8")), start)
+        history = json.loads((out / "history.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(history), 2)
+        for row in history:
+            self.assertIsNotNone(row["validation_pairs_removal"])
+            self.assertIsNotNone(row["validation_pairs_insertion"])
+        self.assertIn("fixed_pairs", json.loads((out / "epoch_001.json").read_text(encoding="utf-8")))
+        self.assertEqual(summary["fine_init"]["weights_sha256"], self.sha)
+        self.assertEqual(summary["fixed_pairs"]["all"]["pairs"], start["fixed_pairs"])
+        self.assertIn("Crop network started from", (out / "report.md").read_text(encoding="utf-8"))
+        plain = self.train("random_start", small_config(), None)  # no pretrained weights: no pair columns
+        self.assertIsNone(plain["fine_init"])
+        self.assertIsNone(plain["history"][0]["validation_pairs_removal"])
+
+    def test_wrong_pairs_or_scores_stop_before_training(self):
+        config = small_config(fine_init_sha256=self.sha)
+
+        def other_pair(result):
+            result["validation_pairs"][0]["volume_id"] = "cycle:not_in_this_store"
+
+        def other_scores(result):
+            result["pretraining"]["final"]["all"]["paired_accuracy"] -= .5
+        with self.assertRaisesRegex(ValueError, "not in this run's validation set"):
+            self.train("bad_pairs", config, self.copy_check("check_bad_pairs", other_pair))
+        with self.assertRaisesRegex(ValueError, "does not reproduce"):
+            self.train("bad_scores", config, self.copy_check("check_bad_scores", other_scores))
+        self.assertFalse((Path(self.tmp.name) / "bad_scores/last.pt").exists())
+
+    def test_notebook_picks_the_newest_passed_check_and_keeps_it_on_resume(self):
+        from rsvt.experiments.m3d_pretrain_check import passed
+        from rsvt.training.m3d_notebook import M3DNotebookSession
+        root = Path(self.tmp.name)
+        runs = root / "init_project/outputs/rsvt_training"
+        runs.mkdir(parents=True)
+
+        def responding(result):
+            result["transfer"]["match"], result["pretraining"]["verdict"] = True, "learned"
+            result["swap_test"]["crop_network_unchanged"] = True
+            for op in ("removal", "insertion"):
+                result["swap_test"]["after_training"][op]["scan_logit"]["paired_accuracy_ci95"] = [.7, .9]
+        import shutil
+        good = self.copy_check("good_check", responding)
+        self.assertTrue(passed(json.loads((good / "pretrain_check.json").read_text(encoding="utf-8"))))
+        shutil.copytree(good, runs / "c2f_20261127T100000_000000Z/pretrain_check")
+        failed = self.copy_check("failed_check", lambda result: result["transfer"].update(match=False))
+        self.assertFalse(passed(json.loads((failed / "pretrain_check.json").read_text(encoding="utf-8"))))
+        shutil.copytree(failed, runs / "c2f_20261127T110000_000000Z/pretrain_check")  # newer, did not pass
+        common = dict(configuration=small_config(), epochs=2, learning_rate=1e-3, patience=0, seed=13,
+                      patients_train=2, patients_validation=1, generators=GENS, metadata_dir=self.fx.meta_dir,
+                      lidc_root=self.fx.lidc, enforce_drive=False, display_enabled=False,
+                      store_root=self.fx.store, cache_root=root / "init_cache")
+        session = M3DNotebookSession(root / "init_project", REPO, fine_init="auto", **common)
+        self.assertEqual(session.fine_init["run"], "c2f_20261127T100000_000000Z")
+        self.assertEqual(session.config["training"]["fine_init_sha256"], self.sha)
+        self.assertIn("pretrained by the crop pretraining check of run c2f_20261127T100000_000000Z",
+                      dict(session.show_configuration())["Crop network start"])
+        with self.assertRaisesRegex(ValueError, "no passed crop pretraining check"):
+            M3DNotebookSession(root / "init_project", REPO, fine_init=str(runs / "c2f_20261127T110000_000000Z"), **common)
+        self.assertIsNone(M3DNotebookSession(root / "init_project", REPO, fine_init="", **common).fine_init)
+        self.assertIsNone(M3DNotebookSession(root / "init_project", REPO, run="pretrain_check", fine_init="auto",
+                                             **common).fine_init)  # only training starts from pretrained weights
+        summary = session.train()
+        self.assertEqual(summary["fine_init"]["weights_sha256"], self.sha)
+        self.assertIsNotNone(session.show_results())  # includes the fixed-pair row
+        session.verify_saved()
+        self.assertIn("Crop network started from the weights pretrained in run c2f_20261127T100000_000000Z",
+                      (session.root / "run_overview.md").read_text(encoding="utf-8"))
+        self.assertEqual(len(session.show_history()), 2)
+        # A newer passed check appears: the resumed run still keeps the weights it started with.
+        shutil.copytree(good, runs / "c2f_20261127T120000_000000Z/pretrain_check")
+        resumed = M3DNotebookSession(root / "init_project", REPO, fine_init="auto", resume_session=str(session.root),
+                                     **common)
+        self.assertEqual(resumed.fine_init, session.fine_init)
+        (good / "fine_branch.pt").write_bytes(b"changed")
+        shutil.copytree(good, runs / "c2f_20261127T130000_000000Z/pretrain_check")
+        with self.assertRaisesRegex(OSError, "differ from their receipt"):
+            M3DNotebookSession(root / "init_project", REPO, fine_init="auto", **common)
+        (root / "init_project_empty/outputs/rsvt_training").mkdir(parents=True)
+        random_start = M3DNotebookSession(root / "init_project_empty", REPO, fine_init="auto", **common)
+        self.assertIsNone(random_start.fine_init)
+        self.assertIn("no passed crop pretraining check", dict(random_start.show_configuration())["Crop network start"])
+
+
 class BoxRuleAndLabelTail(unittest.TestCase):
     """Deeper boxes, inspected label tails and re-streaming under a new rule (25 Nov 2026)."""
 

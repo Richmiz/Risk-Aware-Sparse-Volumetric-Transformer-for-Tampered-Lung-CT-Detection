@@ -55,6 +55,7 @@ manipulated_per_batch = 12
 max_batches_per_epoch = 0 # 0 = every authentic training volume once per epoch
 router_crops_training = 8
 risk_start_epoch = 3
+fine_init_sha256 = ""     # SHA-256 of a crop pretraining check's fine_branch.pt to start the crop network from; "" = random (the notebook fills it in)
 
 [loss]
 volume = 1.0

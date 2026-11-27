@@ -356,6 +356,15 @@ def responds(metrics, key="scan_logit"):
     return [op for op in OPERATIONS if metrics.get(op) and metrics[op][key]["paired_accuracy_ci95"][0] > .5]
 
 
+def passed(result):
+    """Did a saved check reach "proceed with run 3" (the transfer matched and the scan score responds for both operations)?"""
+    swap = result.get("swap_test") or {}
+    after = swap.get("after_training")
+    return bool((result.get("transfer") or {}).get("match") and (result.get("pretraining") or {}).get("verdict")
+                in ("learned", "partly") and after and swap.get("crop_network_unchanged")
+                and len(responds(after)) == len(OPERATIONS))
+
+
 def interpret(transfer, crop_verdict, swap):
     if not transfer["match"]:
         return ("The pretrained crop network scores differently once loaded into the full model (or the model's data "

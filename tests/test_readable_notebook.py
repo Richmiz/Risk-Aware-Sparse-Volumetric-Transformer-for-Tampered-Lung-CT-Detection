@@ -137,7 +137,9 @@ class NotebookSourceTests(unittest.TestCase):
         names=[name for name,_ in code]
         self.assertEqual(names[names.index('crop_check')+1],'training')  # the check comes before training
         cells=dict(code)
-        self.assertIn('RUN = "pretrain_check"',cells['settings'])  # 27 Nov: the checks come before a third run
+        self.assertIn('RUN = "train"',cells['settings'])  # 27 Nov (evening): the checks passed, so run 3 trains
+        self.assertIn('FINE_INIT = "auto"',cells['settings'])  # its crop network starts from the passed check
+        self.assertIn('fine_init=FINE_INIT',cells['session'])
         self.assertIn('run=RUN',cells['session'])
         self.assertIn('RECHECK_DATASET = False',cells['settings'])  # 27 Nov: skip the hour-long full dataset read-back
         self.assertIn('recheck_dataset=RECHECK_DATASET',cells['session'])

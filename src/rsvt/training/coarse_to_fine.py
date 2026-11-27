@@ -14,6 +14,14 @@ earlier RSVT trainer). Crop selection is non-differentiable and reused exactly.
 * Validation also scores each scan with one extra crop at the edit (or, for an
   authentic scan, at one of its real sites). This diagnostic separates what routing
   loses from what the crop stage misses; it is never used for selection.
+
+27 Nov 2026 (after the crop pretraining check passed): run 3 changes only the crop
+network's starting weights. `training.fine_init_sha256` names the weights a crop
+pretraining check saved; `run_training(pretrained=<that check's folder>)` verifies them
+and loads them into the crop network before the first step (a resumed run keeps its own
+weights). Every epoch also scores that check's fixed validation pairs (edited crop vs
+the same crop of the unedited scan), to show whether joint training erodes what the crop
+network learned. Diagnostic only, never used for selection.
 """
 
 from __future__ import annotations
@@ -75,6 +83,9 @@ def validate_config(config):
     _positive(t["min_delta"], "min_delta", zero=True)
     if t["device"] not in ("cpu", "cuda") or t["risk_start_epoch"] >= t["epochs"]:
         raise ValueError("Explicit device and a risk stage before the last epoch required")
+    init = t.get("fine_init_sha256", "")
+    if not isinstance(init, str) or (init and (len(init) != 64 or set(init) - set("0123456789abcdef"))):
+        raise ValueError("fine_init_sha256 must be empty (random start) or the SHA-256 of pretrained crop weights")
     validate_optimization(t)
     for key in TERMS:
         _positive(loss[key], "loss." + key, zero=True)
@@ -99,7 +110,8 @@ def load_c2f_config(path):
 def implementation_fingerprint():
     names = ("rsvt.training.coarse_to_fine", "rsvt.models.coarse_to_fine", "rsvt.data.m3dsynth_dataset",
              "rsvt.data.m3dsynth_store", "rsvt.losses.endpoint_risk", "rsvt.losses.cvar", "rsvt.training.checkpoint",
-             "rsvt.training.optimization", "rsvt.evaluation.classification", "rsvt.utils.reproducibility")
+             "rsvt.training.optimization", "rsvt.evaluation.classification", "rsvt.utils.reproducibility",
+             "rsvt.experiments.m3d_pretrain_check", "rsvt.experiments.m3d_crop_check")  # pretrained start, fixed pairs
     return digest_json({n: sha256_path(Path(importlib.import_module(n).__file__)) for n in names})
 
 
@@ -392,10 +404,68 @@ def evaluate(model, dataset, device, config, *, progress=None, partition="valida
     return volume_metrics(rows, config["evaluation"]["fpr_targets"]), rows
 
 
+# --------------------------------------------------------------------------- pretrained crop network
+
+
+def load_pretrained(folder, config):
+    """Verified crop-network weights and the check that saved them, from a crop pretraining check folder.
+
+    The file must have the checksum the configuration names, match its own receipt, and have
+    been built with this model's crop-network settings.
+    """
+    from rsvt.experiments import m3d_pretrain_check as pretrain  # it imports this module
+    folder = Path(folder)
+    weights = folder / pretrain.WEIGHTS
+    expected = config["training"].get("fine_init_sha256", "")
+    if not expected or sha256_path(weights) != expected:
+        raise ValueError("The pretrained crop weights do not have the checksum the configuration names (fine_init_sha256)")
+    receipt = json.loads(weights.with_name(weights.name + ".json").read_text(encoding="utf-8"))
+    state = load_checkpoint(weights, receipt["contract_sha256"], expected_format=pretrain.WEIGHTS_FORMAT)
+    settings = {k: list(v) if isinstance(v, tuple) else v for k, v in pretrain.fine_kwargs(config["model"]).items()}
+    if state["model_kwargs"] != settings:
+        raise ValueError("The pretrained crop network has other settings: " + json.dumps(state["model_kwargs"]))
+    check_path = folder / "pretrain_check.json"
+    check = json.loads(check_path.read_text(encoding="utf-8"))
+    return {"fine": state["fine"], "check": check,
+            "record": {"folder": str(folder), "weights_sha256": expected, "weights_contract_sha256": receipt["contract_sha256"],
+                       "pretrain_check_sha256": sha256_path(check_path),
+                       "pretrain_check_interpretation": check.get("interpretation")}}
+
+
+def fixed_pairs(store, validation, check, crop_mm, progress=None):
+    """The pretraining check's validation pairs, cut exactly as the model cuts its site crop."""
+    from rsvt.experiments.m3d_pretrain_check import site_pairs
+    rows = {v["volume_id"]: v for v in validation.rows}
+    wanted = [(r["volume_id"], r["crop_shape_zyx"], r["changed_voxels_in_crop"]) for r in check["validation_pairs"]]
+    missing = [w[0] for w in wanted if w[0] not in rows]
+    if missing:
+        raise ValueError(f"{len(missing)} fixed validation pairs are not in this run's validation set (e.g. {missing[0]})")
+    pairs = site_pairs(store, [rows[w[0]] for w in wanted], crop_mm, margin_fraction=0., progress=progress, split="fixed")
+    if [(r["volume_id"], r["crop_shape_zyx"], r["changed_voxels_in_crop"]) for r in pairs["records"]] != wanted:
+        raise ValueError("The fixed validation pairs differ from the crops the pretraining check scored")
+    return pairs
+
+
+def score_fixed_pairs(model, pairs, device):
+    """Share of fixed pairs whose edited crop outscores its unedited twin, crop AUROC and BCE, per operation and generator."""
+    from rsvt.experiments.m3d_crop_check import pair_metrics
+    from rsvt.experiments.m3d_pretrain_check import pair_logits
+    training = model.training
+    model.eval()
+    fake, real = pair_logits(model.encode_crops, pairs["items"], device)
+    model.train(training)
+    return pair_metrics(fake, real, pairs["records"])
+
+
+def _pair_share(scores, group):
+    return ((scores or {}).get(group) or {}).get("paired_accuracy")
+
+
 # --------------------------------------------------------------------------- fit / run
 
 
-def fit(model, train, validation, config, output_dir, contract, *, resume=False, progress=None, stop_after_epoch=None):
+def fit(model, train, validation, config, output_dir, contract, *, resume=False, progress=None, stop_after_epoch=None,
+        pretrained=None):
     t = config["training"]
     destination = Path(output_dir)
     destination.mkdir(parents=True, exist_ok=True)
@@ -419,6 +489,21 @@ def fit(model, train, validation, config, output_dir, contract, *, resume=False,
         history, best, bad, start, best_epoch = (state[k] for k in ("history", "best", "bad", "epoch", "best_epoch"))
     elif (destination / "last.pt").exists():
         raise FileExistsError("Checkpoints exist; resume explicitly")
+    if pretrained and not resume:
+        # Run 3: only the crop network's starting weights change. A resumed run keeps the weights it saved.
+        model.fine.load_state_dict(pretrained["fine"])  # strict: every key and shape must match
+        at_start = score_fixed_pairs(model, pretrained["pairs"], device)
+        reference = pretrained["check"]["pretraining"]["final"]["all"]
+        reproduces = all(abs(at_start["all"][k] - reference[k]) <= .01 for k in ("paired_accuracy", "crop_auroc"))
+        write_json(destination / "fine_init.json", {**pretrained["record"], "fixed_pairs": len(pretrained["pairs"]["records"]),
+                                                    "at_start": at_start, "pretraining_final": pretrained["check"]["pretraining"]["final"],
+                                                    "reproduces_pretraining": reproduces})
+        if not reproduces:
+            raise ValueError("The loaded crop network does not reproduce the pretraining check's scores on its own "
+                             "validation pairs; the weights or the crops differ")
+        if progress:
+            progress({"event": "fine_init", "fixed_pairs_removal": _pair_share(at_start, "removal"),
+                      "fixed_pairs_insertion": _pair_share(at_start, "insertion")})
     began = time.perf_counter()
     for epoch in range(start, t["epochs"]):
         if t["patience"] and bad >= t["patience"]:
@@ -433,6 +518,7 @@ def fit(model, train, validation, config, output_dir, contract, *, resume=False,
                 progress({"event": "logical_batch", "epoch": epoch + 1, "batch": number, "batches": len(batches),
                           "objective": steps[-1]["objective"], "risk_active": risk_active})
         metrics, predictions = evaluate(model, validation, device, config, progress=progress)
+        pair_scores = score_fixed_pairs(model, pretrained["pairs"], device) if pretrained else None
         score = metrics["selection_auroc"]
         eligible = risk_active
         improved = eligible and score is not None and score > best + t["min_delta"]
@@ -455,6 +541,9 @@ def fit(model, train, validation, config, output_dir, contract, *, resume=False,
                "validation_router_recall_removal": (metrics.get("router_recall_by_operation") or {}).get("removal"),
                "validation_router_recall_insertion": (metrics.get("router_recall_by_operation") or {}).get("insertion"),
                "validation_removal_recall_fpr10": metrics["operating_points"].get("fpr_0.1", {}).get("removal_recall"),
+               "validation_pairs_removal": _pair_share(pair_scores, "removal"),
+               "validation_pairs_insertion": _pair_share(pair_scores, "insertion"),
+               "validation_pairs_crop_auroc": ((pair_scores or {}).get("all") or {}).get("crop_auroc"),
                "gradient_norm_mean": float(np.mean([s["gradient_norm"] for s in steps]))}
         history.append(row)
         scheduler.step()
@@ -462,7 +551,8 @@ def fit(model, train, validation, config, output_dir, contract, *, resume=False,
                  "model": {k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
                  "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(), "rng": rng_state(),
                  "history": history, "best": best, "bad": bad, "best_epoch": best_epoch}
-        write_json(destination / f"epoch_{epoch + 1:03d}.json", {"row": row, "validation": metrics, "steps": steps})
+        write_json(destination / f"epoch_{epoch + 1:03d}.json", {"row": row, "validation": metrics, "steps": steps,
+                                                                "fixed_pairs": pair_scores})
         if improved:
             save_checkpoint(destination / "best.pt", state)
             write_json(destination / "best_validation_predictions.json", predictions)
@@ -476,6 +566,7 @@ def fit(model, train, validation, config, output_dir, contract, *, resume=False,
     state = load_checkpoint(selected, binding, expected_format=FORMAT)
     model.load_state_dict(state["model"])
     metrics, predictions = evaluate(model, validation, device, config, progress=progress)
+    selected_pairs = score_fixed_pairs(model, pretrained["pairs"], device) if pretrained else None
     write_json(destination / "selected_validation_predictions.json", predictions)
     last = history[-1]["epoch"] if history else 0
     summary = {"ok": True, "model": "Coarse-to-fine Risk-Aware Sparse Volumetric Transformer",
@@ -487,6 +578,8 @@ def fit(model, train, validation, config, output_dir, contract, *, resume=False,
                "selection_note": (None if best_epoch else
                                   "No risk-stage epoch beat chance on the selection AUROC; the last epoch is reported."),
                "site_crop_check": SITE_CHECK_SCOPE,
+               "fine_init": pretrained["record"] if pretrained else None,
+               "fixed_pairs": selected_pairs,
                "train_volumes": dict(Counter(v["kind"] for v in train.rows)),
                "validation_volumes": dict(Counter(v["kind"] for v in validation.rows)),
                "class_weights": weights, "validation_metrics": metrics, "history": history,
@@ -531,8 +624,13 @@ def build_datasets(store, config):
     return train, validation
 
 
-def run_training(store_root, cache_root, config, output_dir, *, resume=False, progress=None, stop_after_epoch=None):
+def run_training(store_root, cache_root, config, output_dir, *, resume=False, progress=None, stop_after_epoch=None,
+                 pretrained=None):
+    """Train (or resume); `pretrained` is a crop pretraining check folder, required when the config names its weights."""
     config = validate_config(config)
+    if bool(config["training"].get("fine_init_sha256")) != (pretrained is not None):
+        raise ValueError("Pass the pretraining check folder exactly when the configuration names pretrained crop weights")
+    loaded = load_pretrained(pretrained, config) if pretrained is not None else None  # verified before any data work
     store = M3DStore(store_root, cache_root)
     train, validation = build_datasets(store, config)
     store.localize(train.rows + validation.rows, progress=progress)
@@ -547,6 +645,9 @@ def run_training(store_root, cache_root, config, output_dir, *, resume=False, pr
     contract = {"model": "RSVT-C2F", "implementation_sha256": implementation_fingerprint(),
                 "config_sha256": digest_json(config), "manifest_sha256": sha256_path(Path(store_root) / "manifest.json"),
                 "assignments_sha256": store.manifest["assignments_sha256"]}
+    if loaded:
+        contract["pretrain_check_sha256"] = loaded["record"]["pretrain_check_sha256"]
+        loaded["pairs"] = fixed_pairs(store, validation, loaded["check"], config["data"]["crop_mm"], progress)
     if resume:
         stored = json.loads((output / "run_contract.json").read_text(encoding="utf-8"))
         if stored != contract:
@@ -564,7 +665,7 @@ def run_training(store_root, cache_root, config, output_dir, *, resume=False, pr
         model.crops_at_inference, info["shape_zyx"]) | {"example_series": info["series_key"]})
     try:
         summary = fit(model, train, validation, config, output, contract, resume=resume and (output / "last.pt").exists(),
-                      progress=progress, stop_after_epoch=stop_after_epoch)
+                      progress=progress, stop_after_epoch=stop_after_epoch, pretrained=loaded)
     except Exception as exc:
         write_json(output / "failure.json", {"ok": False, "reason": str(exc)})
         raise
@@ -576,8 +677,13 @@ def run_training(store_root, cache_root, config, output_dir, *, resume=False, pr
              f"insertion AUROC {metrics['insertion_auroc']}; worst-generator AUROC {metrics['worst_generator_auroc']}; "
              f"router recall@K {metrics.get('router_recall_at_k')}.", "",
              f"With the edit's crop added (diagnostic): tamper AUROC {(metrics.get('with_site_crop') or {}).get('tamper_auroc')}; "
-             f"that crop alone {(metrics.get('with_site_crop') or {}).get('crop_tamper_auroc')}.", "",
-             "Operating points are exploratory (thresholds from the same validation authentic volumes).", ""]
+             f"that crop alone {(metrics.get('with_site_crop') or {}).get('crop_tamper_auroc')}.", ""]
+    if loaded:
+        pairs = summary["fixed_pairs"]
+        lines += [f"Crop network started from the weights of the pretraining check in `{loaded['record']['folder']}`. "
+                  f"Fixed validation pairs ordered correctly at the selected epoch: removal {_pair_share(pairs, 'removal')}, "
+                  f"insertion {_pair_share(pairs, 'insertion')}.", ""]
+    lines += ["Operating points are exploratory (thresholds from the same validation authentic volumes).", ""]
     (output / "report.md").write_text("\n".join(lines), encoding="utf-8")
     persist_receipt(output)
     return summary

@@ -160,6 +160,22 @@ edit's crop changed no validation scan score by more than 0.0007. Validation rem
 | Paired crop loss in joint training | Deferred | Tested only if the fixed validation pairs degrade during run 3 |
 | Dataset read-back | Narrowed | `RECHECK_DATASET = False` (default, user request): section 7 skips the full read-back (58 min in run 2) when an earlier run read the same store back in full without failures; files are still checked against their manifest checksums when loaded, and the run records which full read-back it relied on |
 
+## Amendment 27 November 2026 (evening) — pretraining check result and run 3
+
+The crop pretraining check (run `c2f_20261127T100922_820082Z`, commit `8d1fca3`) passed both parts. On 192 pairs from
+64 unseen patients the pretrained crop network scored the edited crop above its unedited twin for 96.9% of removals
+and 92.7% of insertions; the transfer into a fresh full model was exact. After 300 steps with the crop network frozen,
+the scan score rose with the edited crop for 86% of removals (95% interval 75–95%) and 83% of insertions (72–92%);
+before that training it did not respond at all. Both checks give the edit's location, so routing is untested.
+
+| Decision | Status | Rule |
+|---|---|---|
+| Next GPU run | Changed | Run 3: `RUN = "train"` (notebook default again) |
+| Crop network start | Changed | The weights of the newest passed pretraining check (`FINE_INIT = "auto"`), named by checksum in the run's configuration, checked against their receipt and the model's crop settings, and required to reproduce the check's validation scores on its 192 pairs (within 0.01) before the first step. A resumed run keeps its own weights |
+| Fixed validation pairs | Added | The check's 192 pairs scored every epoch (share ordered correctly per operation, crop AUROC); diagnostic only, never used for selection |
+| Router, objective, schedule, learning rate, checkpoint rule | Unchanged | As in run 2 |
+| Paired crop loss in joint training | Deferred | Unchanged: tested only if the fixed pairs degrade during run 3 |
+
 Kelanjutan QA 13 November: run `qa_20261113T005049_219029Z` telah direview dari
 Drive. Semua 103 file metadata cocok checksum; 300 hash header sampel cocok F01;
 123 preview tercatat (110 train/13 validation), 25 titik test dikecualikan.
